@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	sv "loadbalancer/server"
-	"loadbalancer/utils"
+	sv "github.com/itsfuad/octoload/server"
+	"github.com/itsfuad/octoload/utils"
 )
 
 type LoadBalancer struct {

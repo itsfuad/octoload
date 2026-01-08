@@ -3,9 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/itsfuad/octoload/balancer"
+	"github.com/itsfuad/octoload/config"
 	"io"
-	"loadbalancer/balancer"
-	"loadbalancer/config"
 	"net/http"
 	"net/http/httptest"
 	"os"

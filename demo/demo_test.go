@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
+	"github.com/itsfuad/octoload/balancer"
 	"io"
-	"loadbalancer/balancer"
 	"log"
 	"math"
 	"net/http"

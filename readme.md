@@ -17,9 +17,30 @@ This project is a Go-based load balancer designed to distribute incoming HTTP re
 - **Demo Servers:** Includes demo servers for easy testing and development
 
 ## Prerequisites
-- Go 1.16 or later
+- Go 1.23 or later
 
 ## Installation
+
+**Install the binary:**
+```sh
+go install github.com/itsfuad/octoload@latest
+```
+Run `octoload` from a directory containing `servers.json`.
+
+**Use as a library:**
+```sh
+go get github.com/itsfuad/octoload@latest
+```
+```go
+import "github.com/itsfuad/octoload/balancer"
+
+lb := balancer.NewLoadBalancer(nil, "round_robin")
+lb.AddServer("http://localhost:8001")
+lb.StartHealthChecks(30 * time.Second)
+http.ListenAndServe(":8080", lb)
+```
+
+**From source:**
 
 1. **Clone the Repository:**
 ```sh

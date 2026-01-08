@@ -10,9 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	"loadbalancer/balancer"
-	"loadbalancer/config"
-	"loadbalancer/utils"
+	"github.com/itsfuad/octoload/balancer"
+	"github.com/itsfuad/octoload/config"
+	"github.com/itsfuad/octoload/utils"
 )
 
 func main() {

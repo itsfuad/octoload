@@ -3,8 +3,8 @@ package server
 import (
 	"bytes"
 	"fmt"
+	"github.com/itsfuad/octoload/utils"
 	"io"
-	"loadbalancer/utils"
 	"log"
 	"net/http"
 	"sync"
