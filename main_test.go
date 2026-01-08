@@ -9,82 +9,48 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
-// MockServer represents a test HTTP server
-type MockServer struct {
-	server *httptest.Server
-	URL    string
-}
-
-// setupMockServers creates test backend servers
-func setupMockServers(count int) []MockServer {
-	var servers []MockServer
-	for i := 0; i < count; i++ {
-		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// setupMockServers starts test backends that are closed when the test ends.
+func setupMockServers(t *testing.T, count int) []*httptest.Server {
+	servers := make([]*httptest.Server, count)
+	for i := range servers {
+		servers[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprintf(w, "Mock Server %d", i+1)
-		})
-		server := httptest.NewServer(handler)
-		servers = append(servers, MockServer{
-			server: server,
-			URL:    server.URL,
-		})
+		}))
+		t.Cleanup(servers[i].Close)
 	}
 	return servers
 }
 
-// createTestConfig creates a temporary config file
-func createTestConfig(t *testing.T, servers []MockServer) string {
-	urls := make([]string, len(servers))
-	for i, s := range servers {
-		urls[i] = s.URL
+// createTestConfig writes a config pointing at servers into a temp file.
+func createTestConfig(t *testing.T, servers []*httptest.Server) string {
+	var cfg config.Config
+	cfg.LoadBalancer.Port = 8080
+	cfg.LoadBalancer.HealthCheckIntervalSeconds = 5
+	cfg.LoadBalancer.Strategy = "round_robin"
+	for _, s := range servers {
+		cfg.Servers.URLs = append(cfg.Servers.URLs, s.URL)
 	}
 
-	configData := config.Config{
-		LoadBalancer: struct {
-			Port                       int    "json:\"port\""
-			HealthCheckIntervalSeconds int    "json:\"health_check_interval_seconds\""
-			Strategy                   string "json:\"strategy\""
-		}{
-			Port:                       8080,
-			HealthCheckIntervalSeconds: 5,
-			Strategy:                   "round_robin",
-		},
-		Servers: struct {
-			URLs []string "json:\"urls\""
-		}{
-			URLs: urls,
-		},
-	}
-
-	file, err := os.CreateTemp("", "test_config_*.json")
+	data, err := json.Marshal(cfg)
 	if err != nil {
-		t.Fatalf("Failed to create temp config file: %v", err)
+		t.Fatalf("Failed to encode config: %v", err)
 	}
-
-	encoder := json.NewEncoder(file)
-	if err := encoder.Encode(configData); err != nil {
-		t.Fatalf("Failed to write config data: %v", err)
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
 	}
-
-	return file.Name()
+	return path
 }
 
 func TestLoadBalancerInitialization(t *testing.T) {
-	// Setup mock servers
-	mockServers := setupMockServers(2)
-	defer func() {
-		for _, s := range mockServers {
-			s.server.Close()
-		}
-	}()
-
-	// Create test config
-	configFile := createTestConfig(t, mockServers)
-	defer os.Remove(configFile)
+	configFile := createTestConfig(t, setupMockServers(t, 2))
 
 	// Test configuration loading
 	cfg, err := config.LoadConfig(configFile)
@@ -182,13 +148,7 @@ func TestGracefulShutdown(t *testing.T) {
 }
 
 func TestLoadBalancerRequestHandling(t *testing.T) {
-	// Setup mock backend servers
-	mockServers := setupMockServers(2)
-	defer func() {
-		for _, s := range mockServers {
-			s.server.Close()
-		}
-	}()
+	mockServers := setupMockServers(t, 2)
 
 	// Create load balancer
 	lb := balancer.NewLoadBalancer(nil, "round_robin")
@@ -220,5 +180,27 @@ func TestLoadBalancerRequestHandling(t *testing.T) {
 
 	if len(body) == 0 {
 		t.Error("Expected non-empty response body")
+	}
+}
+
+func TestRetryPreservesRequestBody(t *testing.T) {
+	dead := httptest.NewServer(http.NotFoundHandler())
+	dead.Close()
+	echo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(w, r.Body)
+	}))
+	t.Cleanup(echo.Close)
+
+	lb := balancer.NewLoadBalancer(nil, "round_robin")
+	for _, url := range []string{dead.URL, echo.URL} {
+		if err := lb.AddServer(url); err != nil {
+			t.Fatalf("Failed to add server: %v", err)
+		}
+	}
+
+	rw := httptest.NewRecorder()
+	lb.ServeHTTP(rw, httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x")))
+	if rw.Code != http.StatusOK || rw.Body.String() != "x" {
+		t.Fatalf("Expected 200 with echoed body after retry, got %d %q", rw.Code, rw.Body.String())
 	}
 }

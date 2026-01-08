@@ -16,34 +16,25 @@ import (
 )
 
 func main() {
-	// Setup logger
 	logger := log.New(os.Stdout, "load-balancer: ", log.LstdFlags)
 
-	// Load configuration and initialize Redis
-	config, err := config.LoadConfig()
+	cfg, err := config.LoadConfig()
 	if err != nil {
 		logger.Fatalf("Error loading configuration: %v\n", err)
 	}
 
-	// Create load balancer with strategy from config
-	lb := balancer.NewLoadBalancer(logger, config.LoadBalancer.Strategy)
-
-	// Add servers from configuration
-	for _, url := range config.Servers.URLs {
+	lb := balancer.NewLoadBalancer(logger, cfg.LoadBalancer.Strategy)
+	for _, url := range cfg.Servers.URLs {
 		lb.AddServer(url)
 	}
 
-	// Start health checks
-	healthCheckInterval := time.Duration(config.LoadBalancer.HealthCheckIntervalSeconds) * time.Second
-	lb.StartHealthChecks(healthCheckInterval)
+	lb.StartHealthChecks(time.Duration(cfg.LoadBalancer.HealthCheckIntervalSeconds) * time.Second)
 
-	// Add metrics endpoint
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		metrics := lb.GetMetrics()
 		json.NewEncoder(w).Encode(metrics)
 	})
 
-	// Setup graceful shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
@@ -53,8 +44,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Start the load balancer
-	port := config.LoadBalancer.Port
+	port := cfg.LoadBalancer.Port
 	logger.Println(utils.Colorize(fmt.Sprintf("Load balancer is running on port %d", port), utils.GREEN))
 	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), lb); err != nil {
 		logger.Fatalf("Load balancer failed: %v\n", err)

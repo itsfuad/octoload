@@ -11,16 +11,15 @@ import (
 	"time"
 )
 
-const HealthyKey = ":healthy"
+// client is immutable shared config; connection pooling comes from DefaultTransport.
+var client = &http.Client{Timeout: 30 * time.Second}
 
 type Server struct {
-	URL           string
-	Load          int
-	Healthy       bool
-	LastChecked   time.Time
-	ResponseTimes []time.Duration
-	mu            sync.RWMutex
-	logger        *log.Logger
+	URL     string
+	Load    int
+	Healthy bool
+	mu      sync.RWMutex
+	logger  *log.Logger
 }
 
 func NewServer(url string, logger *log.Logger) *Server {
@@ -46,13 +45,6 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) error {
 		s.mu.Unlock()
 	}()
 
-	start := time.Now()
-
-	// Create new request with timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
 	var bodyBytes []byte
 	var err error
 	if r.Body != nil {
@@ -60,59 +52,37 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return fmt.Errorf("failed to read request body: %v", err)
 		}
-		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		// Restore body so the balancer can retry on another server.
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
-	req, err := http.NewRequest(r.Method, s.URL+r.RequestURI, bytes.NewBuffer(bodyBytes))
+	req, err := http.NewRequest(r.Method, s.URL+r.RequestURI, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %v", err)
 	}
+	req.Header = r.Header.Clone()
 
-	// Copy headers
-	utils.CopyHeaders(req.Header, r.Header)
-
-	// Execute request
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to execute request: %v", err)
 	}
 	defer resp.Body.Close()
 
-	// Update response times
-	duration := time.Since(start)
-	s.updateResponseTime(duration)
-
-	// Copy response
 	utils.CopyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	_, err = io.Copy(w, resp.Body)
-	if err != nil {
+	if _, err = io.Copy(w, resp.Body); err != nil {
 		return fmt.Errorf("failed to copy response: %v", err)
 	}
 
 	return nil
 }
 
-func (s *Server) updateResponseTime(duration time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.ResponseTimes = append(s.ResponseTimes, duration)
-	if len(s.ResponseTimes) > 100 {
-		s.ResponseTimes = s.ResponseTimes[1:]
-	}
-}
-
-func PrintState(url string, load int, finished bool) string {
-	if finished {
-		return fmt.Sprintf("Finished request on server %s. Current load: %s\n", utils.Colorize(url, utils.GREEN), utils.Colorize(fmt.Sprintf("%d", load), utils.YELLOW))
-	}
-	return fmt.Sprintf("Handling request on server %s. Current load: %s\n", utils.Colorize(url, utils.GREEN), utils.Colorize(fmt.Sprintf("%d", load), utils.YELLOW))
-}
-
 func (s *Server) CheckHealth() {
 	resp, err := http.Get(s.URL + "/")
+	if err == nil {
+		resp.Body.Close()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
