@@ -70,17 +70,19 @@ func TestLoadBalancerInitialization(t *testing.T) {
 }
 
 func TestMetricsEndpoint(t *testing.T) {
-	// Create a test server with the metrics endpoint
-	lb := balancer.NewLoadBalancer(nil, "round_robin")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/metrics" {
-			metrics := lb.GetMetrics()
-			json.NewEncoder(w).Encode(metrics)
-		}
-	}))
+	// No backends: /metrics must answer locally, everything else reaches lb (503).
+	server := httptest.NewServer(newMux(balancer.NewLoadBalancer(nil, "round_robin")))
 	defer server.Close()
 
-	// Test metrics endpoint
+	proxied, err := http.Get(server.URL + "/")
+	if err != nil {
+		t.Fatalf("Failed to get /: %v", err)
+	}
+	proxied.Body.Close()
+	if proxied.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("Expected / to reach load balancer (503), got %v", proxied.Status)
+	}
+
 	resp, err := http.Get(server.URL + "/metrics")
 	if err != nil {
 		t.Fatalf("Failed to get metrics: %v", err)

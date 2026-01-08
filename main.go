@@ -30,11 +30,6 @@ func main() {
 
 	lb.StartHealthChecks(time.Duration(cfg.LoadBalancer.HealthCheckIntervalSeconds) * time.Second)
 
-	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		metrics := lb.GetMetrics()
-		json.NewEncoder(w).Encode(metrics)
-	})
-
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
@@ -46,7 +41,17 @@ func main() {
 
 	port := cfg.LoadBalancer.Port
 	logger.Println(utils.Colorize(fmt.Sprintf("Load balancer is running on port %d", port), utils.GREEN))
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), lb); err != nil {
+	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), newMux(lb)); err != nil {
 		logger.Fatalf("Load balancer failed: %v\n", err)
 	}
+}
+
+// newMux serves /metrics locally and proxies everything else through lb.
+func newMux(lb *balancer.LoadBalancer) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(lb.GetMetrics())
+	})
+	mux.Handle("/", lb)
+	return mux
 }
