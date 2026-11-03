@@ -293,7 +293,7 @@ func TestForwardedHeaders(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			requests := make(chan *http.Request, 1)
 			backend := newBackend(t, func(_ http.ResponseWriter, r *http.Request) { requests <- r.Clone(context.Background()) })
-			lb := NewLoadBalancer(nil, "round_robin")
+			lb := newTestBalancer(t, "round_robin")
 			lb.ServerOptions.TrustForwardedHeaders = tt.trust
 			if err := lb.AddServer(backend.URL); err != nil {
 				t.Fatalf("AddServer: %v", err)
@@ -549,7 +549,7 @@ func TestFailureStatuses(t *testing.T) {
 }
 
 func TestAddServerRejectsInvalidURL(t *testing.T) {
-	lb := NewLoadBalancer(nil, "round_robin")
+	lb := newTestBalancer(t, "round_robin")
 	if err := lb.AddServer("localhost:8001"); err == nil {
 		t.Fatal("expected error")
 	}

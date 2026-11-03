@@ -57,7 +57,8 @@ type Server struct {
 	logger       *log.Logger
 }
 
-func NewServer(rawURL string, logger *log.Logger, options Options) (*Server, error) {
+// ParseURL parses and validates a backend URL.
+func ParseURL(rawURL string) (*url.URL, error) {
 	target, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid server URL %q: %w", rawURL, err)
@@ -65,12 +66,28 @@ func NewServer(rawURL string, logger *log.Logger, options Options) (*Server, err
 	if (target.Scheme != "http" && target.Scheme != "https") || target.Host == "" || target.RawQuery != "" {
 		return nil, fmt.Errorf("invalid server URL %q: want http(s)://host[:port][/path]", rawURL)
 	}
+	return target, nil
+}
+
+// ValidateHealthCheckPath accepts "" (the default) or a path starting with "/".
+func ValidateHealthCheckPath(path string) error {
+	if path != "" && !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("invalid health check path %q: must start with /", path)
+	}
+	return nil
+}
+
+func NewServer(rawURL string, logger *log.Logger, options Options) (*Server, error) {
+	target, err := ParseURL(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateHealthCheckPath(options.HealthCheckPath); err != nil {
+		return nil, err
+	}
 
 	if options.HealthCheckPath == "" {
 		options.HealthCheckPath = "/"
-	}
-	if !strings.HasPrefix(options.HealthCheckPath, "/") {
-		return nil, fmt.Errorf("invalid health check path %q: must start with /", options.HealthCheckPath)
 	}
 	if options.HealthCheckTimeout == 0 {
 		options.HealthCheckTimeout = 2 * time.Second

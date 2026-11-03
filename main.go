@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -21,12 +22,18 @@ import (
 func main() {
 	logger := log.New(os.Stdout, "load-balancer: ", log.LstdFlags)
 
-	cfg, err := config.LoadConfig()
+	configPath := flag.String("config", "servers.json", "path to the configuration file")
+	flag.Parse()
+
+	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		logger.Fatalf("Error loading configuration: %v\n", err)
 	}
 
-	lb := balancer.NewLoadBalancer(logger, cfg.LoadBalancer.Strategy)
+	lb, err := balancer.NewLoadBalancer(logger, cfg.LoadBalancer.Strategy)
+	if err != nil {
+		logger.Fatalf("Error creating load balancer: %v\n", err)
+	}
 	lb.ServerOptions = sv.Options{
 		TrustForwardedHeaders: cfg.LoadBalancer.TrustForwardedHeaders,
 		HealthCheckPath:       cfg.LoadBalancer.HealthCheckPath,

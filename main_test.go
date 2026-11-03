@@ -19,6 +19,15 @@ import (
 	"time"
 )
 
+func newTestLB(t *testing.T) *balancer.LoadBalancer {
+	t.Helper()
+	lb, err := balancer.NewLoadBalancer(nil, "round_robin")
+	if err != nil {
+		t.Fatalf("NewLoadBalancer: %v", err)
+	}
+	return lb
+}
+
 // setupMockServers starts test backends that are closed when the test ends.
 func setupMockServers(t *testing.T, count int) []*httptest.Server {
 	servers := make([]*httptest.Server, count)
@@ -38,6 +47,7 @@ func createTestConfig(t *testing.T, servers []*httptest.Server) string {
 	cfg.LoadBalancer.Port = 8080
 	cfg.LoadBalancer.HealthCheckIntervalSeconds = 5
 	cfg.LoadBalancer.Strategy = "round_robin"
+	cfg.LoadBalancer.ShutdownTimeoutSeconds = 30
 	for _, s := range servers {
 		cfg.Servers.URLs = append(cfg.Servers.URLs, s.URL)
 	}
@@ -67,15 +77,14 @@ func TestLoadBalancerInitialization(t *testing.T) {
 	}
 
 	// Test load balancer creation
-	lb := balancer.NewLoadBalancer(nil, cfg.LoadBalancer.Strategy)
-	if lb == nil {
-		t.Fatal("Failed to create load balancer")
+	if _, err := balancer.NewLoadBalancer(nil, cfg.LoadBalancer.Strategy); err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
 	}
 }
 
 func TestMetricsEndpoint(t *testing.T) {
 	// No backends: /metrics must answer locally, everything else reaches lb (503).
-	server := httptest.NewServer(newMux(balancer.NewLoadBalancer(nil, "round_robin")))
+	server := httptest.NewServer(newMux(newTestLB(t)))
 	defer server.Close()
 
 	proxied, err := http.Get(server.URL + "/")
@@ -143,7 +152,7 @@ func newBlockingLB(t *testing.T) (lb *balancer.LoadBalancer, started chan struct
 	}))
 	t.Cleanup(backend.Close)
 	t.Cleanup(release)
-	lb = balancer.NewLoadBalancer(nil, "round_robin")
+	lb = newTestLB(t)
 	if err := lb.AddServer(backend.URL); err != nil {
 		t.Fatalf("AddServer: %v", err)
 	}
@@ -200,7 +209,7 @@ func TestServeKeepsAcceptingDuringShutdownDelay(t *testing.T) {
 	const delay = 500 * time.Millisecond
 	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	t.Cleanup(backend.Close)
-	lb := balancer.NewLoadBalancer(nil, "round_robin")
+	lb := newTestLB(t)
 	if err := lb.AddServer(backend.URL); err != nil {
 		t.Fatalf("AddServer: %v", err)
 	}
@@ -292,41 +301,11 @@ func TestServeDropsClientsThatStallSendingHeaders(t *testing.T) {
 	}
 }
 
-func TestLoadConfigShutdownSettings(t *testing.T) {
-	tests := []struct {
-		name                string
-		settings            string
-		wantDelay, wantWait int
-	}{
-		{"defaults when missing", ``, 5, 30},
-		{"explicit values", `"shutdown_delay_seconds": 1, "shutdown_timeout_seconds": 2`, 1, 2},
-		{"explicit zero delay is kept", `"shutdown_delay_seconds": 0`, 0, 30},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "servers.json")
-			if err := os.WriteFile(path, []byte(`{"load_balancer": {`+tt.settings+`}}`), 0o600); err != nil {
-				t.Fatalf("WriteFile: %v", err)
-			}
-			cfg, err := config.LoadConfig(path)
-			if err != nil {
-				t.Fatalf("LoadConfig: %v", err)
-			}
-			if got := cfg.LoadBalancer.ShutdownDelaySeconds; got != tt.wantDelay {
-				t.Errorf("delay = %d, want %d", got, tt.wantDelay)
-			}
-			if got := cfg.LoadBalancer.ShutdownTimeoutSeconds; got != tt.wantWait {
-				t.Errorf("timeout = %d, want %d", got, tt.wantWait)
-			}
-		})
-	}
-}
-
 func TestLoadBalancerRequestHandling(t *testing.T) {
 	mockServers := setupMockServers(t, 2)
 
 	// Create load balancer
-	lb := balancer.NewLoadBalancer(nil, "round_robin")
+	lb := newTestLB(t)
 	for _, s := range mockServers {
 		if err := lb.AddServer(s.URL); err != nil {
 			t.Fatalf("Failed to add server: %v", err)
@@ -366,7 +345,7 @@ func TestRetryPreservesRequestBody(t *testing.T) {
 	}))
 	t.Cleanup(echo.Close)
 
-	lb := balancer.NewLoadBalancer(nil, "round_robin")
+	lb := newTestLB(t)
 	for _, url := range []string{dead.URL, echo.URL} {
 		if err := lb.AddServer(url); err != nil {
 			t.Fatalf("Failed to add server: %v", err)

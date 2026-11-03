@@ -2,7 +2,12 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
+
+	"github.com/itsfuad/octoload/balancer"
+	sv "github.com/itsfuad/octoload/server"
 )
 
 type Config struct {
@@ -24,16 +29,11 @@ type Config struct {
 	} `json:"servers"`
 }
 
-func LoadConfig(filenames ...string) (*Config, error) {
-
-	filename := "servers.json"
-	if len(filenames) > 0 {
-		filename = filenames[0]
-	}
-
-	file, err := os.Open(filename)
+// LoadConfig reads and validates the configuration file at path.
+func LoadConfig(path string) (*Config, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading config: %w", err)
 	}
 	defer file.Close()
 
@@ -41,9 +41,42 @@ func LoadConfig(filenames ...string) (*Config, error) {
 	// Set before decoding so an explicit 0 in the file stays distinct from a missing field.
 	config.LoadBalancer.ShutdownDelaySeconds = 5
 	config.LoadBalancer.ShutdownTimeoutSeconds = 30
-	if err := json.NewDecoder(file).Decode(config); err != nil {
-		return nil, err
+
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields() // A misspelled option must not silently keep its default.
+	if err := decoder.Decode(config); err != nil {
+		return nil, fmt.Errorf("parsing config %s: %w", path, err)
+	}
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config %s:\n%w", path, err)
+	}
+	return config, nil
+}
+
+// Validate reports every problem at once, so fixing a config takes one pass.
+func (c *Config) Validate() error {
+	var errs []error
+	require := func(ok bool, format string, args ...any) {
+		if !ok {
+			errs = append(errs, fmt.Errorf(format, args...))
+		}
 	}
 
-	return config, nil
+	lb := &c.LoadBalancer
+	require(lb.Port >= 1 && lb.Port <= 65535, "port must be 1-65535, got %d", lb.Port)
+	require(lb.HealthCheckIntervalSeconds > 0, "health_check_interval_seconds must be positive, got %d", lb.HealthCheckIntervalSeconds)
+	require(lb.HealthCheckTimeoutSeconds >= 0, "health_check_timeout_seconds must not be negative, got %d", lb.HealthCheckTimeoutSeconds)
+	require(lb.ShutdownDelaySeconds >= 0, "shutdown_delay_seconds must not be negative, got %d", lb.ShutdownDelaySeconds)
+	require(lb.ShutdownTimeoutSeconds > 0, "shutdown_timeout_seconds must be positive, got %d", lb.ShutdownTimeoutSeconds)
+	require(len(c.Servers.URLs) > 0, "servers.urls must not be empty")
+	errs = append(errs, balancer.ValidateStrategy(lb.Strategy), sv.ValidateHealthCheckPath(lb.HealthCheckPath))
+
+	seen := map[string]bool{}
+	for _, url := range c.Servers.URLs {
+		_, err := sv.ParseURL(url)
+		errs = append(errs, err)
+		require(!seen[url], "duplicate server URL %q", url)
+		seen[url] = true
+	}
+	return errors.Join(errs...)
 }

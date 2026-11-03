@@ -34,6 +34,12 @@ type LoadBalancer struct {
 	stopHealthChecks map[string]context.CancelFunc
 }
 
+// Load balancing strategies. An empty strategy means StrategyLeastActive.
+const (
+	StrategyRoundRobin  = "round_robin"
+	StrategyLeastActive = "least_active"
+)
+
 const (
 	maxRetries          = 3
 	defaultDrainTimeout = 30 * time.Second
@@ -45,7 +51,19 @@ type Metrics struct {
 	ActiveConnections int64
 }
 
-func NewLoadBalancer(logger *log.Logger, strategy string) *LoadBalancer {
+// ValidateStrategy rejects strategies that would otherwise silently act as the default.
+func ValidateStrategy(strategy string) error {
+	switch strategy {
+	case "", StrategyRoundRobin, StrategyLeastActive:
+		return nil
+	}
+	return fmt.Errorf("unknown strategy %q: want %s or %s", strategy, StrategyRoundRobin, StrategyLeastActive)
+}
+
+func NewLoadBalancer(logger *log.Logger, strategy string) (*LoadBalancer, error) {
+	if err := ValidateStrategy(strategy); err != nil {
+		return nil, err
+	}
 	if logger == nil {
 		logger = log.New(io.Discard, "", log.LstdFlags)
 	}
@@ -55,7 +73,7 @@ func NewLoadBalancer(logger *log.Logger, strategy string) *LoadBalancer {
 		strategy:         strategy,
 		drainTimeout:     defaultDrainTimeout,
 		stopHealthChecks: map[string]context.CancelFunc{},
-	}
+	}, nil
 }
 
 func (lb *LoadBalancer) AddServer(url string) error {
@@ -165,10 +183,10 @@ func (lb *LoadBalancer) GetRoundRobinServer() *sv.Server {
 }
 
 func (lb *LoadBalancer) GetServer() *sv.Server {
-	if lb.strategy == "round_robin" {
+	if lb.strategy == StrategyRoundRobin {
 		return lb.GetRoundRobinServer()
 	}
-	return lb.GetLeastLoadedServer() // "least_active" and default
+	return lb.GetLeastLoadedServer()
 }
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {

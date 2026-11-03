@@ -95,7 +95,10 @@ func testStrategy(t *testing.T, strategy string, serverConfigs []demoServer) {
 	t.Logf("Testing %s strategy", strategy)
 
 	logger := log.New(os.Stdout, fmt.Sprintf("[%s] ", strategy), log.LstdFlags)
-	lb := balancer.NewLoadBalancer(logger, strategy)
+	lb, err := balancer.NewLoadBalancer(logger, strategy)
+	if err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
+	}
 
 	for _, cfg := range serverConfigs {
 		url := fmt.Sprintf("http://localhost:%d", cfg.port)

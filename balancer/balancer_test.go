@@ -22,7 +22,10 @@ import (
 
 func newTestBalancer(t *testing.T, strategy string, urls ...string) *LoadBalancer {
 	t.Helper()
-	lb := NewLoadBalancer(nil, strategy)
+	lb, err := NewLoadBalancer(nil, strategy)
+	if err != nil {
+		t.Fatalf("NewLoadBalancer: %v", err)
+	}
 	for _, url := range urls {
 		if err := lb.AddServer(url); err != nil {
 			t.Fatalf("AddServer(%s): %v", url, err)
@@ -289,6 +292,17 @@ func TestFailureClassification(t *testing.T) {
 				t.Errorf("provesBackendDown = %v, want %v", got, tt.wantBackendDn)
 			}
 		})
+	}
+}
+
+func TestNewLoadBalancerRejectsUnknownStrategy(t *testing.T) {
+	if _, err := NewLoadBalancer(nil, "roundrobin"); err == nil {
+		t.Fatal("expected error")
+	}
+	for _, strategy := range []string{"", StrategyRoundRobin, StrategyLeastActive} {
+		if _, err := NewLoadBalancer(nil, strategy); err != nil {
+			t.Errorf("strategy %q: %v", strategy, err)
+		}
 	}
 }
 
