@@ -1,20 +1,27 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"github.com/itsfuad/octoload/utils"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 )
 
 // ErrUnhealthy means a request was refused before any backend I/O.
 var ErrUnhealthy = errors.New("server is not healthy")
+
+// unhealthyAfter is how many failed checks in a row mark a backend down, so one
+// slow check does not eject it. One success restores it.
+const unhealthyAfter = 2
 
 // transport is immutable shared config; connection pools are kept per backend host.
 var transport = func() *http.Transport {
@@ -27,18 +34,30 @@ var transport = func() *http.Transport {
 	return t
 }()
 
-type Server struct {
-	URL     string
-	Load    atomic.Int64
-	Healthy atomic.Bool
+// Options configures a Server. Zero values select the defaults.
+type Options struct {
 	// TrustForwardedHeaders keeps inbound X-Forwarded-* values. Enable only behind
 	// a trusted edge: otherwise clients can spoof their IP and scheme.
 	TrustForwardedHeaders bool
-	target                *url.URL
-	logger                *log.Logger
+	// HealthCheckPath is requested by CheckHealth. Default "/".
+	HealthCheckPath string
+	// HealthCheckTimeout bounds each check. Default 2s.
+	HealthCheckTimeout time.Duration
 }
 
-func NewServer(rawURL string, logger *log.Logger) (*Server, error) {
+type Server struct {
+	URL          string
+	Load         atomic.Int64
+	Healthy      atomic.Bool
+	options      Options
+	healthURL    string
+	healthClient *http.Client
+	failedChecks atomic.Int32
+	target       *url.URL
+	logger       *log.Logger
+}
+
+func NewServer(rawURL string, logger *log.Logger, options Options) (*Server, error) {
 	target, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid server URL %q: %w", rawURL, err)
@@ -47,7 +66,24 @@ func NewServer(rawURL string, logger *log.Logger) (*Server, error) {
 		return nil, fmt.Errorf("invalid server URL %q: want http(s)://host[:port][/path]", rawURL)
 	}
 
-	s := &Server{URL: rawURL, target: target, logger: logger}
+	if options.HealthCheckPath == "" {
+		options.HealthCheckPath = "/"
+	}
+	if !strings.HasPrefix(options.HealthCheckPath, "/") {
+		return nil, fmt.Errorf("invalid health check path %q: must start with /", options.HealthCheckPath)
+	}
+	if options.HealthCheckTimeout == 0 {
+		options.HealthCheckTimeout = 2 * time.Second
+	}
+
+	s := &Server{
+		URL:          rawURL,
+		options:      options,
+		healthURL:    strings.TrimSuffix(rawURL, "/") + options.HealthCheckPath,
+		healthClient: &http.Client{Transport: transport, Timeout: options.HealthCheckTimeout},
+		target:       target,
+		logger:       logger,
+	}
 	s.Healthy.Store(true)
 	return s, nil
 }
@@ -87,7 +123,7 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	// routes on the query, so forwarding it raw cannot cause a parsing mismatch.
 	pr.Out.URL.RawQuery = pr.In.URL.RawQuery
 
-	if !s.TrustForwardedHeaders {
+	if !s.options.TrustForwardedHeaders {
 		pr.SetXForwarded()
 		return
 	}
@@ -100,16 +136,41 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	}
 }
 
-func (s *Server) CheckHealth() {
-	resp, err := http.Get(s.URL + "/")
-	if err == nil {
-		resp.Body.Close()
+// CheckHealth probes the backend once and updates Healthy. A cancelled ctx says
+// nothing about the backend, so it changes nothing.
+func (s *Server) CheckHealth(ctx context.Context) {
+	err := s.probe(ctx)
+	if ctx.Err() != nil {
+		return
 	}
 
-	if err != nil || resp.StatusCode != http.StatusOK {
-		s.Healthy.Store(false)
-		s.logger.Println(utils.Colorize(fmt.Sprintf("Server %s is unhealthy\n", s.URL), utils.RED))
-	} else {
-		s.Healthy.Store(true)
+	if err == nil {
+		s.failedChecks.Store(0)
+		if !s.Healthy.Swap(true) {
+			s.logger.Println(utils.Colorize(fmt.Sprintf("Server %s recovered", s.URL), utils.GREEN))
+		}
+		return
 	}
+	if s.failedChecks.Add(1) >= unhealthyAfter && s.Healthy.Swap(false) {
+		s.logger.Println(utils.Colorize(fmt.Sprintf("Server %s is unhealthy: %v", s.URL, err), utils.RED))
+	}
+}
+
+func (s *Server) probe(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.healthURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := s.healthClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	// Drain a little so small responses can reuse the connection.
+	io.CopyN(io.Discard, resp.Body, 64<<10)
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("health check returned status %d", resp.StatusCode)
+	}
+	return nil
 }

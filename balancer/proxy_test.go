@@ -294,7 +294,7 @@ func TestForwardedHeaders(t *testing.T) {
 			requests := make(chan *http.Request, 1)
 			backend := newBackend(t, func(_ http.ResponseWriter, r *http.Request) { requests <- r.Clone(context.Background()) })
 			lb := NewLoadBalancer(nil, "round_robin")
-			lb.TrustForwardedHeaders = tt.trust
+			lb.ServerOptions.TrustForwardedHeaders = tt.trust
 			if err := lb.AddServer(backend.URL); err != nil {
 				t.Fatalf("AddServer: %v", err)
 			}

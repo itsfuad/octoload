@@ -1,12 +1,15 @@
 package balancer
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -121,7 +124,7 @@ func TestRemoveServerReturnsUnderConstantTraffic(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for !stop.Load() {
-			checked.CheckHealth()
+			checked.CheckHealth(context.Background())
 		}
 	}()
 	t.Cleanup(func() {
@@ -185,6 +188,69 @@ func TestRoundRobinOrderSkipsUnhealthy(t *testing.T) {
 		if url == "http://b" {
 			t.Fatal("selected unhealthy server")
 		}
+	}
+}
+
+func TestHealthChecksStopWhenContextEnds(t *testing.T) {
+	var hits atomic.Int32
+	backend := newBackend(t, func(http.ResponseWriter, *http.Request) { hits.Add(1) })
+	lb := newTestBalancer(t, "round_robin", backend.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lb.StartHealthChecks(ctx, time.Millisecond)
+	eventually(t, "checks to run", func() bool { return hits.Load() >= 2 })
+
+	cancel()
+	assertHitsStop(t, &hits)
+	eventually(t, "checker goroutine to exit", func() bool {
+		stacks := make([]byte, 1<<20)
+		return !bytes.Contains(stacks[:runtime.Stack(stacks, true)], []byte("startHealthCheck"))
+	})
+}
+
+func TestRemoveServerStopsItsHealthChecks(t *testing.T) {
+	var removedHits, keptHits atomic.Int32
+	removed := newBackend(t, func(http.ResponseWriter, *http.Request) { removedHits.Add(1) })
+	kept := newBackend(t, func(http.ResponseWriter, *http.Request) { keptHits.Add(1) })
+	lb := newTestBalancer(t, "round_robin", removed.URL, kept.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lb.StartHealthChecks(ctx, time.Millisecond)
+	eventually(t, "checks to run", func() bool { return removedHits.Load() >= 2 })
+
+	if err := lb.RemoveServer(removed.URL); err != nil {
+		t.Fatalf("RemoveServer: %v", err)
+	}
+	assertHitsStop(t, &removedHits)
+
+	before := keptHits.Load()
+	eventually(t, "other server to stay checked", func() bool { return keptHits.Load() > before })
+}
+
+func TestServerAddedAfterStartIsChecked(t *testing.T) {
+	backend := newBackend(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) })
+	lb := newTestBalancer(t, "round_robin")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lb.StartHealthChecks(ctx, time.Millisecond)
+
+	if err := lb.AddServer(backend.URL); err != nil {
+		t.Fatalf("AddServer: %v", err)
+	}
+	eventually(t, "new server to be marked down", func() bool { return !lb.Servers[0].Healthy.Load() })
+}
+
+// assertHitsStop allows in-flight checks to land, then requires no new ones.
+func assertHitsStop(t *testing.T, hits *atomic.Int32) {
+	t.Helper()
+	time.Sleep(50 * time.Millisecond)
+	settled := hits.Load()
+	time.Sleep(50 * time.Millisecond)
+	if got := hits.Load(); got != settled {
+		t.Errorf("checks kept running: %d hits grew to %d", settled, got)
 	}
 }
 

@@ -1,6 +1,7 @@
 package balancer
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -21,12 +22,16 @@ type LoadBalancer struct {
 	Servers []*sv.Server
 	mu      sync.RWMutex
 	Logger  *log.Logger
-	// TrustForwardedHeaders applies to servers added after it is set. See sv.Server.
-	TrustForwardedHeaders bool
-	metrics               *Metrics
-	strategy              string
-	rotation              atomic.Uint64
-	drainTimeout          time.Duration
+	// ServerOptions applies to servers added after it is set.
+	ServerOptions sv.Options
+	metrics       *Metrics
+	strategy      string
+	rotation      atomic.Uint64
+	drainTimeout  time.Duration
+	// healthCtx is set by StartHealthChecks so servers added later join the checks.
+	healthCtx        context.Context
+	healthInterval   time.Duration
+	stopHealthChecks map[string]context.CancelFunc
 }
 
 const (
@@ -45,10 +50,11 @@ func NewLoadBalancer(logger *log.Logger, strategy string) *LoadBalancer {
 		logger = log.New(io.Discard, "", log.LstdFlags)
 	}
 	return &LoadBalancer{
-		Logger:       logger,
-		metrics:      &Metrics{},
-		strategy:     strategy,
-		drainTimeout: defaultDrainTimeout,
+		Logger:           logger,
+		metrics:          &Metrics{},
+		strategy:         strategy,
+		drainTimeout:     defaultDrainTimeout,
+		stopHealthChecks: map[string]context.CancelFunc{},
 	}
 }
 
@@ -63,12 +69,14 @@ func (lb *LoadBalancer) AddServer(url string) error {
 		return fmt.Errorf("server %s already exists", url)
 	}
 
-	server, err := sv.NewServer(url, lb.Logger)
+	server, err := sv.NewServer(url, lb.Logger, lb.ServerOptions)
 	if err != nil {
 		return err
 	}
-	server.TrustForwardedHeaders = lb.TrustForwardedHeaders
 	lb.Servers = append(lb.Servers, server)
+	if lb.healthCtx != nil {
+		lb.startHealthCheck(server)
+	}
 	lb.Logger.Println(utils.Colorize("Added server "+url+" to the load balancer", utils.GREEN))
 	return nil
 }
@@ -83,6 +91,10 @@ func (lb *LoadBalancer) RemoveServer(url string) error {
 	server := lb.Servers[i]
 	// Remove before draining: a listed server keeps receiving traffic and may never drain.
 	lb.Servers = slices.Delete(lb.Servers, i, i+1)
+	if stop, ok := lb.stopHealthChecks[url]; ok {
+		stop()
+		delete(lb.stopHealthChecks, url)
+	}
 	lb.mu.Unlock()
 	lb.Logger.Println(utils.Colorize("Removed server "+url, utils.YELLOW))
 
@@ -231,16 +243,33 @@ func provesBackendDown(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
-func (lb *LoadBalancer) StartHealthChecks(interval time.Duration) {
-	lb.mu.RLock()
-	defer lb.mu.RUnlock()
+// StartHealthChecks checks every server now and each interval until ctx is done,
+// including servers added later. Call it once. Without it, nothing restores a
+// backend that was ejected after refusing a connection.
+func (lb *LoadBalancer) StartHealthChecks(ctx context.Context, interval time.Duration) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
 
+	lb.healthCtx, lb.healthInterval = ctx, interval
 	for _, server := range lb.Servers {
-		go func(s *sv.Server) {
-			for {
-				s.CheckHealth()
-				time.Sleep(interval)
-			}
-		}(server)
+		lb.startHealthCheck(server)
 	}
+}
+
+// startHealthCheck requires lb.mu held for writing.
+func (lb *LoadBalancer) startHealthCheck(server *sv.Server) {
+	ctx, stop := context.WithCancel(lb.healthCtx)
+	lb.stopHealthChecks[server.URL] = stop
+	interval := lb.healthInterval
+
+	go func() {
+		for {
+			server.CheckHealth(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(interval):
+			}
+		}
+	}()
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"github.com/itsfuad/octoload/balancer"
 	"io"
@@ -103,7 +104,9 @@ func testStrategy(t *testing.T, strategy string, serverConfigs []demoServer) {
 		}
 	}
 
-	go lb.StartHealthChecks(5 * time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	lb.StartHealthChecks(ctx, 5*time.Second)
 	time.Sleep(2 * time.Second)
 
 	numRequests := 10

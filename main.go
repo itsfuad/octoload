@@ -14,6 +14,7 @@ import (
 
 	"github.com/itsfuad/octoload/balancer"
 	"github.com/itsfuad/octoload/config"
+	sv "github.com/itsfuad/octoload/server"
 	"github.com/itsfuad/octoload/utils"
 )
 
@@ -26,14 +27,19 @@ func main() {
 	}
 
 	lb := balancer.NewLoadBalancer(logger, cfg.LoadBalancer.Strategy)
-	lb.TrustForwardedHeaders = cfg.LoadBalancer.TrustForwardedHeaders
+	lb.ServerOptions = sv.Options{
+		TrustForwardedHeaders: cfg.LoadBalancer.TrustForwardedHeaders,
+		HealthCheckPath:       cfg.LoadBalancer.HealthCheckPath,
+		HealthCheckTimeout:    time.Duration(cfg.LoadBalancer.HealthCheckTimeoutSeconds) * time.Second,
+	}
 	for _, url := range cfg.Servers.URLs {
 		if err := lb.AddServer(url); err != nil {
 			logger.Fatalf("Error adding server: %v\n", err)
 		}
 	}
 
-	lb.StartHealthChecks(time.Duration(cfg.LoadBalancer.HealthCheckIntervalSeconds) * time.Second)
+	// Not tied to the stop signal: routing needs health data until the drain ends.
+	lb.StartHealthChecks(context.Background(), time.Duration(cfg.LoadBalancer.HealthCheckIntervalSeconds)*time.Second)
 
 	port := cfg.LoadBalancer.Port
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))

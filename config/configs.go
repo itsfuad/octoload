@@ -9,7 +9,9 @@ type Config struct {
 	LoadBalancer struct {
 		Port                       int    `json:"port"`
 		HealthCheckIntervalSeconds int    `json:"health_check_interval_seconds"`
-		Strategy                   string `json:"strategy"` // "least_active" or "round_robin"
+		HealthCheckPath            string `json:"health_check_path"`            // Default "/"
+		HealthCheckTimeoutSeconds  int    `json:"health_check_timeout_seconds"` // Default 2
+		Strategy                   string `json:"strategy"`                     // "least_active" or "round_robin"
 		// TrustForwardedHeaders keeps inbound X-Forwarded-*. Enable only behind a trusted edge.
 		TrustForwardedHeaders bool `json:"trust_forwarded_headers"`
 		// ShutdownDelaySeconds keeps serving after a stop signal so external load
