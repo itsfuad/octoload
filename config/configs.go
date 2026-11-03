@@ -6,10 +6,7 @@ import (
 )
 
 type Config struct {
-	RedisHost     string
-	RedisPort     string
-	RedisPassword string
-	LoadBalancer  struct {
+	LoadBalancer struct {
 		Port                       int    `json:"port"`
 		HealthCheckIntervalSeconds int    `json:"health_check_interval_seconds"`
 		Strategy                   string `json:"strategy"` // "least_active" or "round_robin"

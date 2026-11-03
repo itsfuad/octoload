@@ -6,25 +6,26 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	sv "loadbalancer/server"
-	"loadbalancer/utils"
+	sv "github.com/itsfuad/octoload/server"
+	"github.com/itsfuad/octoload/utils"
 )
 
 type LoadBalancer struct {
 	Servers         []*sv.Server
 	mu              sync.RWMutex
 	Logger          *log.Logger
-	wg              sync.WaitGroup
 	shutdown        bool
 	metrics         *Metrics
-	maxRetries      int
 	strategy        string
 	roundRobinIndex int64
 }
+
+const maxRetries = 3
 
 type Metrics struct {
 	TotalRequests     uint64
@@ -36,13 +37,9 @@ func NewLoadBalancer(logger *log.Logger, strategy string) *LoadBalancer {
 	if logger == nil {
 		logger = log.New(io.Discard, "", log.LstdFlags)
 	}
-	if strategy == "" {
-		strategy = "least_active" // default strategy
-	}
 	return &LoadBalancer{
 		Logger:          logger,
 		metrics:         &Metrics{},
-		maxRetries:      3,
 		strategy:        strategy,
 		roundRobinIndex: -1,
 	}
@@ -52,16 +49,11 @@ func (lb *LoadBalancer) AddServer(url string) error {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
 
-	// Validate server URL
 	if url == "" {
 		return errors.New("server URL cannot be empty")
 	}
-
-	// Check for duplicate servers
-	for _, server := range lb.Servers {
-		if server.URL == url {
-			return fmt.Errorf("server %s already exists", url)
-		}
+	if slices.ContainsFunc(lb.Servers, func(s *sv.Server) bool { return s.URL == url }) {
+		return fmt.Errorf("server %s already exists", url)
 	}
 
 	server := sv.NewServer(url, lb.Logger)
@@ -107,11 +99,7 @@ func (lb *LoadBalancer) GetLeastLoadedServer() *sv.Server {
 
 	var leastLoadedServer *sv.Server
 	for _, server := range lb.Servers {
-		healthy := server.Healthy
-		load := server.Load
-
-		if healthy && (leastLoadedServer == nil || load < leastLoadedServer.Load) {
-			server.Load = load
+		if server.Healthy && (leastLoadedServer == nil || server.Load < leastLoadedServer.Load) {
 			leastLoadedServer = server
 		}
 	}
@@ -148,38 +136,29 @@ func (lb *LoadBalancer) GetRoundRobinServer() *sv.Server {
 }
 
 func (lb *LoadBalancer) GetServer() *sv.Server {
-	switch lb.strategy {
-	case "round_robin":
+	if lb.strategy == "round_robin" {
 		return lb.GetRoundRobinServer()
-	case "least_active":
-		return lb.GetLeastLoadedServer()
-	default:
-		// Default to least active
-		return lb.GetLeastLoadedServer()
 	}
+	return lb.GetLeastLoadedServer() // "least_active" and default
 }
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Increment metrics
 	atomic.AddUint64(&lb.metrics.TotalRequests, 1)
 	atomic.AddInt64(&lb.metrics.ActiveConnections, 1)
 	defer atomic.AddInt64(&lb.metrics.ActiveConnections, -1)
 
-	// Check if we're shutting down
 	if lb.shutdown {
 		http.Error(w, "Service is shutting down", http.StatusServiceUnavailable)
 		return
 	}
 
-	// Try multiple servers if needed
-	var err error
-	for retry := 0; retry < lb.maxRetries; retry++ {
+	for retry := range maxRetries {
 		server := lb.GetServer()
 		if server == nil {
 			continue
 		}
 
-		err = server.HandleRequest(w, r)
+		err := server.HandleRequest(w, r)
 		if err == nil {
 			return
 		}
@@ -187,7 +166,6 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		lb.Logger.Printf("Request failed on server %s, attempt %d: %v", server.URL, retry+1, err)
 	}
 
-	// All retries failed
 	atomic.AddUint64(&lb.metrics.FailedRequests, 1)
 	http.Error(w, "All servers failed to process the request", http.StatusServiceUnavailable)
 }
@@ -204,16 +182,11 @@ func (lb *LoadBalancer) StartHealthChecks(interval time.Duration) {
 }
 
 func (lb *LoadBalancer) GracefulShutdown() {
-	// Notify about the shutdown process
 	lb.Logger.Println(utils.Colorize("Shutting down load balancer gracefully", utils.YELLOW))
 
-	// Stop accepting new requests
 	lb.mu.Lock()
 	lb.shutdown = true
 	lb.mu.Unlock()
-
-	// Wait for ongoing requests to complete
-	lb.wg.Wait()
 
 	lb.Logger.Println(utils.Colorize("All servers have been shut down, and connections are closed.", utils.YELLOW))
 }

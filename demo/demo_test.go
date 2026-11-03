@@ -2,31 +2,35 @@ package main
 
 import (
 	"fmt"
+	"github.com/itsfuad/octoload/balancer"
 	"io"
-	"loadbalancer/balancer"
 	"log"
+	"math"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
 
-// TestLoadBalancerWithDemoServers spawns real demo servers and tests load balancing
-func TestLoadBalancerWithDemoServers(t *testing.T) {
-	// Build the demo server first
+type demoServer struct{ id, port int }
+
+// buildDemo compiles demo_server.go into bin and removes it when the test ends.
+func buildDemo(t *testing.T, bin string) {
 	t.Log("Building demo server...")
-	buildCmd := exec.Command("go", "build", "-o", "demo_server.exe", "demo_server.go")
-	if err := buildCmd.Run(); err != nil {
+	if err := exec.Command("go", "build", "-o", bin, "demo_server.go").Run(); err != nil {
 		t.Fatalf("Failed to build demo server: %v", err)
 	}
-	defer os.Remove("demo_server.exe")
+	t.Cleanup(func() { os.Remove(bin) })
+}
 
-	// Define server configurations
-	serverConfigs := []struct {
-		id   int
-		port int
-	}{
+// TestLoadBalancerWithDemoServers spawns real demo servers and tests load balancing
+func TestLoadBalancerWithDemoServers(t *testing.T) {
+	buildDemo(t, "demo_server.exe")
+
+	serverConfigs := []demoServer{
 		{id: 1, port: 9001},
 		{id: 2, port: 9002},
 		{id: 3, port: 9003},
@@ -86,7 +90,7 @@ func TestLoadBalancerWithDemoServers(t *testing.T) {
 	})
 }
 
-func testStrategy(t *testing.T, strategy string, serverConfigs []struct{ id, port int }) {
+func testStrategy(t *testing.T, strategy string, serverConfigs []demoServer) {
 	t.Logf("Testing %s strategy", strategy)
 
 	logger := log.New(os.Stdout, fmt.Sprintf("[%s] ", strategy), log.LstdFlags)
@@ -120,23 +124,15 @@ func sendRequestsThroughBalancer(t *testing.T, lb *balancer.LoadBalancer, numReq
 			t.Fatalf("Failed to create request: %v", err)
 		}
 
-		rw := &testResponseWriter{
-			headers: make(http.Header),
-			body:    make([]byte, 0),
-		}
-
+		rw := httptest.NewRecorder()
 		lb.ServeHTTP(rw, req)
 
-		if rw.statusCode == 0 {
-			rw.statusCode = http.StatusOK
-		}
-
-		if rw.statusCode != http.StatusOK {
-			t.Logf("Request %d failed with status: %d", i+1, rw.statusCode)
+		if rw.Code != http.StatusOK {
+			t.Logf("Request %d failed with status: %d", i+1, rw.Code)
 			continue
 		}
 
-		response := string(rw.body)
+		response := rw.Body.String()
 		serverHits[response]++
 		successfulRequests++
 		t.Logf("Request %d: %s", i+1, response)
@@ -144,7 +140,7 @@ func sendRequestsThroughBalancer(t *testing.T, lb *balancer.LoadBalancer, numReq
 	return serverHits, successfulRequests
 }
 
-func verifyLoadDistribution(t *testing.T, strategy string, serverConfigs []struct{ id, port int }, serverHits map[string]int, successfulRequests, numRequests int) {
+func verifyLoadDistribution(t *testing.T, strategy string, serverConfigs []demoServer, serverHits map[string]int, successfulRequests, numRequests int) {
 	t.Logf("\n=== Load Distribution Summary for %s ===", strategy)
 	for response, count := range serverHits {
 		t.Logf("%s: %d requests", response, count)
@@ -160,7 +156,7 @@ func verifyLoadDistribution(t *testing.T, strategy string, serverConfigs []struc
 		tolerance := expectedHitsPerServer * 0.5
 
 		for response, hits := range serverHits {
-			diff := abs(float64(hits) - expectedHitsPerServer)
+			diff := math.Abs(float64(hits) - expectedHitsPerServer)
 			if diff > tolerance {
 				t.Logf("Warning: Uneven distribution for %s: got %d hits, expected ~%.1f",
 					response, hits, expectedHitsPerServer)
@@ -170,42 +166,9 @@ func verifyLoadDistribution(t *testing.T, strategy string, serverConfigs []struc
 	}
 }
 
-// testResponseWriter is a custom ResponseWriter for testing
-type testResponseWriter struct {
-	headers    http.Header
-	body       []byte
-	statusCode int
-}
-
-func (w *testResponseWriter) Header() http.Header {
-	return w.headers
-}
-
-func (w *testResponseWriter) Write(data []byte) (int, error) {
-	w.body = append(w.body, data...)
-	return len(data), nil
-}
-
-func (w *testResponseWriter) WriteHeader(statusCode int) {
-	w.statusCode = statusCode
-}
-
-func abs(x float64) float64 {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
-
 // TestDemoServerDirectly tests demo servers directly without load balancer
 func TestDemoServerDirectly(t *testing.T) {
-	// Build the demo server
-	t.Log("Building demo server...")
-	buildCmd := exec.Command("go", "build", "-o", "demo_server_test.exe", "demo_server.go")
-	if err := buildCmd.Run(); err != nil {
-		t.Fatalf("Failed to build demo server: %v", err)
-	}
-	defer os.Remove("demo_server_test.exe")
+	buildDemo(t, "demo_server_test.exe")
 
 	// Start a single demo server
 	cmd := exec.Command("./demo_server_test.exe", "-id", "99", "-port", "9099")
@@ -241,20 +204,7 @@ func TestDemoServerDirectly(t *testing.T) {
 
 	// Verify response contains server ID
 	expectedSubstring := "SERVER 99"
-	if !contains(response, expectedSubstring) {
+	if !strings.Contains(response, expectedSubstring) {
 		t.Errorf("Expected response to contain '%s', got: %s", expectedSubstring, response)
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) && containsHelper(s, substr))
-}
-
-func containsHelper(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

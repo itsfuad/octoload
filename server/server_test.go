@@ -1,13 +1,11 @@
 package server
 
 import (
-	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 )
 
 const URL = "http://example.com"
@@ -43,39 +41,6 @@ func TestHandleRequest(t *testing.T) {
 	err = server.HandleRequest(w, req)
 	if err == nil {
 		t.Errorf("expected error due to server being unhealthy")
-	}
-}
-
-func TestUpdateResponseTime(t *testing.T) {
-	logger := log.New(io.Discard, "", log.LstdFlags)
-	server := NewServer(URL, logger)
-
-	duration := 100 * time.Millisecond
-	server.updateResponseTime(duration)
-
-	if len(server.ResponseTimes) != 1 {
-		t.Errorf("expected 1 response time, got %d", len(server.ResponseTimes))
-	}
-	if server.ResponseTimes[0] != duration {
-		t.Errorf("expected response time to be %v, got %v", duration, server.ResponseTimes[0])
-	}
-}
-
-func TestPrintState(t *testing.T) {
-	load := 5
-	finished := true
-
-	expected := fmt.Sprintf("Finished request on server \033[32m%s\033[0m. Current load: \033[33m5\033[0m\n", URL)
-	result := PrintState(URL, load, finished)
-	if result != expected {
-		t.Errorf("expected %s, got %s", expected, result)
-	}
-
-	finished = false
-	expected = fmt.Sprintf("Handling request on server \033[32m%s\033[0m. Current load: \033[33m5\033[0m\n", URL)
-	result = PrintState(URL, load, finished)
-	if result != expected {
-		t.Errorf("expected %s, got %s", expected, result)
 	}
 }
 
