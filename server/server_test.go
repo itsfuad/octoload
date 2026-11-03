@@ -33,6 +33,22 @@ func TestNewServer(t *testing.T) {
 	}
 }
 
+func TestNewServerAcceptsNilLogger(t *testing.T) {
+	dead := httptest.NewServer(http.NotFoundHandler())
+	dead.Close()
+
+	server, err := NewServer(dead.URL, nil, Options{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	for range unhealthyAfter {
+		server.CheckHealth(context.Background()) // Logs the state change.
+	}
+	if server.Healthy.Load() {
+		t.Error("expected dead backend to be marked down")
+	}
+}
+
 func TestNewServerRejectsInvalidURLs(t *testing.T) {
 	for _, rawURL := range []string{"", "not a url", "localhost:8001", "ftp://host", "http://", "http://a b", "http://a?x=1"} {
 		if _, err := NewServer(rawURL, nil, Options{}); err == nil {

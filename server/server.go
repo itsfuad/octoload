@@ -87,6 +87,9 @@ func NewServer(rawURL string, logger *slog.Logger, options Options) (*Server, er
 		return nil, err
 	}
 
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	if options.HealthCheckPath == "" {
 		options.HealthCheckPath = "/"
 	}

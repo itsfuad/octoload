@@ -8,7 +8,7 @@ An HTTP load balancer in Go, using only the standard library. It distributes req
 
 - **Strategies:** round robin, or least active connections
 - **Health checks:** timeouts, configurable path, and thresholds so one slow check does not eject a backend
-- **Safe retries:** failover that never replays a request a backend may have acted on
+- **Safe retries:** failover that never repeats a request with a body or a non-idempotent method once it may have reached a backend
 - **Streaming:** request and response bodies are streamed, including WebSocket upgrades and server-sent events
 - **Graceful shutdown:** a delay for external load balancers to stop routing here, then a bounded drain
 - **Operations:** JSON logs, `/metrics`, `/livez` and `/readyz` on a separate admin port
@@ -89,7 +89,7 @@ Always call `StartHealthChecks`: it is the only thing that restores a backend ej
 
 A backend is marked down after 2 failed health checks in a row, and restored by 1 success. A refused connection also ejects it immediately until its next check.
 
-Failed requests follow this rule, which never repeats a request a backend may have acted on:
+Failed requests follow this rule. Only bodyless `GET`, `HEAD` and `OPTIONS` requests are repeated once they may have reached a backend, so those endpoints should be free of side effects:
 
 | Failure | Retried on another backend? | Ejects the backend? |
 |---|---|---|
@@ -160,6 +160,7 @@ DynamicUser=yes
 
 - No TLS termination. Terminate at an edge proxy.
 - No limit on concurrent connections or request rate.
+- Up to 100 idle connections are kept per backend. Sustained traffic above that opens and closes extra backend connections.
 - Metrics are JSON only, with no Prometheus format. The admin port has no authentication.
 - No access log, and no tracing.
 - Configuration is read at startup. Restart to change it.
