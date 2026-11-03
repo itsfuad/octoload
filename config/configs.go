@@ -13,6 +13,7 @@ import (
 type Config struct {
 	LoadBalancer struct {
 		Port                       int    `json:"port"`
+		AdminPort                  int    `json:"admin_port"` // Serves /metrics, /livez and /readyz. 0 disables.
 		HealthCheckIntervalSeconds int    `json:"health_check_interval_seconds"`
 		HealthCheckPath            string `json:"health_check_path"`            // Default "/"
 		HealthCheckTimeoutSeconds  int    `json:"health_check_timeout_seconds"` // Default 2
@@ -64,6 +65,8 @@ func (c *Config) Validate() error {
 
 	lb := &c.LoadBalancer
 	require(lb.Port >= 1 && lb.Port <= 65535, "port must be 1-65535, got %d", lb.Port)
+	require(lb.AdminPort >= 0 && lb.AdminPort <= 65535, "admin_port must be 0-65535, got %d", lb.AdminPort)
+	require(lb.AdminPort == 0 || lb.AdminPort != lb.Port, "admin_port must differ from port, both are %d", lb.Port)
 	require(lb.HealthCheckIntervalSeconds > 0, "health_check_interval_seconds must be positive, got %d", lb.HealthCheckIntervalSeconds)
 	require(lb.HealthCheckTimeoutSeconds >= 0, "health_check_timeout_seconds must not be negative, got %d", lb.HealthCheckTimeoutSeconds)
 	require(lb.ShutdownDelaySeconds >= 0, "shutdown_delay_seconds must not be negative, got %d", lb.ShutdownDelaySeconds)

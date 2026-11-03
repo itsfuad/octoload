@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/itsfuad/octoload/utils"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -54,7 +54,8 @@ type Server struct {
 	healthClient *http.Client
 	failedChecks atomic.Int32
 	target       *url.URL
-	logger       *log.Logger
+	logger       *slog.Logger
+	proxyLog     *log.Logger
 }
 
 // ParseURL parses and validates a backend URL.
@@ -77,7 +78,7 @@ func ValidateHealthCheckPath(path string) error {
 	return nil
 }
 
-func NewServer(rawURL string, logger *log.Logger, options Options) (*Server, error) {
+func NewServer(rawURL string, logger *slog.Logger, options Options) (*Server, error) {
 	target, err := ParseURL(rawURL)
 	if err != nil {
 		return nil, err
@@ -100,6 +101,7 @@ func NewServer(rawURL string, logger *log.Logger, options Options) (*Server, err
 		healthClient: &http.Client{Transport: transport, Timeout: options.HealthCheckTimeout},
 		target:       target,
 		logger:       logger,
+		proxyLog:     slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 	s.Healthy.Store(true)
 	return s, nil
@@ -126,7 +128,7 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) error {
 	proxy := httputil.ReverseProxy{
 		Rewrite:      s.rewrite,
 		Transport:    transport,
-		ErrorLog:     s.logger,
+		ErrorLog:     s.proxyLog,
 		ErrorHandler: func(_ http.ResponseWriter, _ *http.Request, err error) { proxyErr = err },
 	}
 	proxy.ServeHTTP(w, r)
@@ -164,12 +166,12 @@ func (s *Server) CheckHealth(ctx context.Context) {
 	if err == nil {
 		s.failedChecks.Store(0)
 		if !s.Healthy.Swap(true) {
-			s.logger.Println(utils.Colorize(fmt.Sprintf("Server %s recovered", s.URL), utils.GREEN))
+			s.logger.Info("server recovered", "url", s.URL)
 		}
 		return
 	}
 	if s.failedChecks.Add(1) >= unhealthyAfter && s.Healthy.Swap(false) {
-		s.logger.Println(utils.Colorize(fmt.Sprintf("Server %s is unhealthy: %v", s.URL, err), utils.RED))
+		s.logger.Warn("server unhealthy", "url", s.URL, "error", err)
 	}
 }
 

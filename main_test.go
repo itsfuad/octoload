@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -82,33 +83,109 @@ func TestLoadBalancerInitialization(t *testing.T) {
 	}
 }
 
+func TestAdminEndpoints(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(backend.Close)
+	lb := newTestLB(t)
+	if err := lb.AddServer(backend.URL); err != nil {
+		t.Fatalf("AddServer: %v", err)
+	}
+	var draining atomic.Bool
+	admin := httptest.NewServer(newAdminMux(lb, &draining))
+	t.Cleanup(admin.Close)
+
+	status := func(path string) int {
+		t.Helper()
+		resp, err := http.Get(admin.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	expect := func(when string, livez, readyz int) {
+		t.Helper()
+		if got := status("/livez"); got != livez {
+			t.Errorf("%s: /livez = %d, want %d", when, got, livez)
+		}
+		if got := status("/readyz"); got != readyz {
+			t.Errorf("%s: /readyz = %d, want %d", when, got, readyz)
+		}
+	}
+
+	expect("healthy", http.StatusOK, http.StatusOK)
+
+	lb.Servers[0].Healthy.Store(false)
+	expect("backend outage must not restart the balancer", http.StatusOK, http.StatusServiceUnavailable)
+
+	lb.Servers[0].Healthy.Store(true)
+	draining.Store(true)
+	expect("draining", http.StatusOK, http.StatusServiceUnavailable)
+
+	if got := status("/"); got != http.StatusNotFound {
+		t.Errorf("admin / = %d, want 404: admin port must not proxy", got)
+	}
+}
+
 func TestMetricsEndpoint(t *testing.T) {
-	// No backends: /metrics must answer locally, everything else reaches lb (503).
-	server := httptest.NewServer(newMux(newTestLB(t)))
-	defer server.Close()
-
-	proxied, err := http.Get(server.URL + "/")
-	if err != nil {
-		t.Fatalf("Failed to get /: %v", err)
+	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(backend.Close)
+	lb := newTestLB(t)
+	if err := lb.AddServer(backend.URL); err != nil {
+		t.Fatalf("AddServer: %v", err)
 	}
-	proxied.Body.Close()
-	if proxied.StatusCode != http.StatusServiceUnavailable {
-		t.Errorf("Expected / to reach load balancer (503), got %v", proxied.Status)
-	}
+	var draining atomic.Bool
+	admin := httptest.NewServer(newAdminMux(lb, &draining))
+	t.Cleanup(admin.Close)
 
-	resp, err := http.Get(server.URL + "/metrics")
+	lb.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+
+	resp, err := http.Get(admin.URL + "/metrics")
 	if err != nil {
 		t.Fatalf("Failed to get metrics: %v", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("Expected status OK, got %v", resp.Status)
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q", ct)
 	}
 
 	var metrics balancer.Metrics
 	if err := json.NewDecoder(resp.Body).Decode(&metrics); err != nil {
 		t.Fatalf("Failed to decode metrics: %v", err)
+	}
+	if metrics.TotalRequests != 1 {
+		t.Errorf("TotalRequests = %d, want 1", metrics.TotalRequests)
+	}
+	want := balancer.BackendMetrics{URL: backend.URL, Healthy: true}
+	if len(metrics.Backends) != 1 || metrics.Backends[0] != want {
+		t.Errorf("Backends = %+v, want [%+v]", metrics.Backends, want)
+	}
+}
+
+// Regression: /metrics on the traffic port hid any backend path of the same name.
+func TestTrafficPortProxiesEveryPath(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "backend ", r.URL.Path)
+	}))
+	t.Cleanup(backend.Close)
+	lb := newTestLB(t)
+	if err := lb.AddServer(backend.URL); err != nil {
+		t.Fatalf("AddServer: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	url, _ := startServe(t, ctx, lb, 0, time.Second)
+
+	for _, path := range []string{"/metrics", "/livez", "/readyz"} {
+		resp, err := http.Get(url + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(body) != "backend "+path {
+			t.Errorf("%s answered %q, want it proxied", path, body)
+		}
 	}
 }
 

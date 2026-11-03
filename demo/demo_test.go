@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"github.com/itsfuad/octoload/balancer"
 	"io"
-	"log"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -94,7 +94,7 @@ func TestLoadBalancerWithDemoServers(t *testing.T) {
 func testStrategy(t *testing.T, strategy string, serverConfigs []demoServer) {
 	t.Logf("Testing %s strategy", strategy)
 
-	logger := log.New(os.Stdout, fmt.Sprintf("[%s] ", strategy), log.LstdFlags)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil)).With("strategy", strategy)
 	lb, err := balancer.NewLoadBalancer(logger, strategy)
 	if err != nil {
 		t.Fatalf("Failed to create load balancer: %v", err)

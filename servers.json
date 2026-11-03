@@ -8,6 +8,7 @@
     },
     "load_balancer": {
       "port": 8080,
+      "admin_port": 8081,
       "health_check_interval_seconds": 5,
       "strategy": "round_robin"
     }

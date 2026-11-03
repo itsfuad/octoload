@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"slices"
@@ -15,13 +15,12 @@ import (
 	"time"
 
 	sv "github.com/itsfuad/octoload/server"
-	"github.com/itsfuad/octoload/utils"
 )
 
 type LoadBalancer struct {
 	Servers []*sv.Server
 	mu      sync.RWMutex
-	Logger  *log.Logger
+	Logger  *slog.Logger
 	// ServerOptions applies to servers added after it is set.
 	ServerOptions sv.Options
 	metrics       *Metrics
@@ -49,6 +48,13 @@ type Metrics struct {
 	TotalRequests     uint64
 	FailedRequests    uint64
 	ActiveConnections int64
+	Backends          []BackendMetrics
+}
+
+type BackendMetrics struct {
+	URL     string
+	Healthy bool
+	Load    int64
 }
 
 // ValidateStrategy rejects strategies that would otherwise silently act as the default.
@@ -60,12 +66,12 @@ func ValidateStrategy(strategy string) error {
 	return fmt.Errorf("unknown strategy %q: want %s or %s", strategy, StrategyRoundRobin, StrategyLeastActive)
 }
 
-func NewLoadBalancer(logger *log.Logger, strategy string) (*LoadBalancer, error) {
+func NewLoadBalancer(logger *slog.Logger, strategy string) (*LoadBalancer, error) {
 	if err := ValidateStrategy(strategy); err != nil {
 		return nil, err
 	}
 	if logger == nil {
-		logger = log.New(io.Discard, "", log.LstdFlags)
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &LoadBalancer{
 		Logger:           logger,
@@ -95,7 +101,7 @@ func (lb *LoadBalancer) AddServer(url string) error {
 	if lb.healthCtx != nil {
 		lb.startHealthCheck(server)
 	}
-	lb.Logger.Println(utils.Colorize("Added server "+url+" to the load balancer", utils.GREEN))
+	lb.Logger.Info("server added", "url", url)
 	return nil
 }
 
@@ -114,7 +120,7 @@ func (lb *LoadBalancer) RemoveServer(url string) error {
 		delete(lb.stopHealthChecks, url)
 	}
 	lb.mu.Unlock()
-	lb.Logger.Println(utils.Colorize("Removed server "+url, utils.YELLOW))
+	lb.Logger.Info("server removed", "url", url)
 
 	// shortcut: a request that selected this server just before removal can start after load reads 0; add per-server draining if callers need a hard guarantee.
 	deadline := time.Now().Add(lb.drainTimeout)
@@ -128,10 +134,18 @@ func (lb *LoadBalancer) RemoveServer(url string) error {
 }
 
 func (lb *LoadBalancer) GetMetrics() *Metrics {
+	lb.mu.RLock()
+	defer lb.mu.RUnlock()
+
+	backends := make([]BackendMetrics, 0, len(lb.Servers))
+	for _, server := range lb.Servers {
+		backends = append(backends, BackendMetrics{URL: server.URL, Healthy: server.Healthy.Load(), Load: server.Load.Load()})
+	}
 	return &Metrics{
 		TotalRequests:     atomic.LoadUint64(&lb.metrics.TotalRequests),
 		FailedRequests:    atomic.LoadUint64(&lb.metrics.FailedRequests),
 		ActiveConnections: atomic.LoadInt64(&lb.metrics.ActiveConnections),
+		Backends:          backends,
 	}
 }
 
@@ -153,10 +167,6 @@ func (lb *LoadBalancer) GetLeastLoadedServer() *sv.Server {
 		}
 	}
 
-	if leastLoadedServer != nil {
-		lb.Logger.Println(utils.Colorize("Selected server "+leastLoadedServer.URL+" with load "+fmt.Sprint(leastLoad), utils.BLUE))
-	}
-
 	return leastLoadedServer
 }
 
@@ -175,11 +185,7 @@ func (lb *LoadBalancer) GetRoundRobinServer() *sv.Server {
 		return nil
 	}
 
-	selectedServer := healthyServers[(lb.rotation.Add(1)-1)%uint64(len(healthyServers))]
-
-	lb.Logger.Println(utils.Colorize("Selected server "+selectedServer.URL+" (round robin)", utils.BLUE))
-
-	return selectedServer
+	return healthyServers[(lb.rotation.Add(1)-1)%uint64(len(healthyServers))]
 }
 
 func (lb *LoadBalancer) GetServer() *sv.Server {
@@ -224,10 +230,10 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return // Client is gone: not a backend failure, and nobody to answer.
 		}
 
-		lb.Logger.Printf("Request failed on server %s, attempt %d: %v", server.URL, retry+1, err)
+		lb.Logger.Warn("request failed", "url", server.URL, "attempt", retry+1, "method", r.Method, "path", r.URL.Path, "error", err)
 		status = http.StatusBadGateway
-		if provesBackendDown(err) {
-			server.Healthy.Store(false)
+		if provesBackendDown(err) && server.Healthy.Swap(false) {
+			lb.Logger.Warn("server unhealthy", "url", server.URL, "error", err)
 		}
 		if !canRetry(r, err) {
 			break

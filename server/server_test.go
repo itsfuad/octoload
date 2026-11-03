@@ -1,12 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,7 +17,7 @@ import (
 const URL = "http://example.com"
 
 func TestNewServer(t *testing.T) {
-	logger := log.New(io.Discard, "", log.LstdFlags)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	server, err := NewServer(URL, logger, Options{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -64,7 +66,7 @@ func TestHandleRequest(t *testing.T) {
 
 func newTestServer(t *testing.T, url string, options Options) *Server {
 	t.Helper()
-	server, err := NewServer(url, log.New(io.Discard, "", log.LstdFlags), options)
+	server, err := NewServer(url, slog.New(slog.NewTextHandler(io.Discard, nil)), options)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -181,6 +183,45 @@ func TestCheckHealthFailureThresholdAndRecovery(t *testing.T) {
 	check(false, "still failing")
 	failing.Store(false)
 	check(true, "one success recovers")
+}
+
+// Regression: every failed check logged a line.
+func TestCheckHealthLogsOnlyStateChanges(t *testing.T) {
+	var failing atomic.Bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if failing.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	t.Cleanup(backend.Close)
+
+	var logs bytes.Buffer
+	server, err := NewServer(backend.URL, slog.New(slog.NewTextHandler(&logs, nil)), Options{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	check := func(times int) {
+		for range times {
+			server.CheckHealth(context.Background())
+		}
+	}
+
+	check(3)
+	if logs.Len() != 0 {
+		t.Errorf("healthy checks logged: %s", logs.String())
+	}
+
+	failing.Store(true)
+	check(5)
+	if got := strings.Count(logs.String(), "server unhealthy"); got != 1 {
+		t.Errorf("logged unhealthy %d times, want 1:\n%s", got, logs.String())
+	}
+
+	failing.Store(false)
+	check(3)
+	if got := strings.Count(logs.String(), "server recovered"); got != 1 {
+		t.Errorf("logged recovery %d times, want 1:\n%s", got, logs.String())
+	}
 }
 
 func TestCheckHealthRestoresPassivelyEjectedBackend(t *testing.T) {
