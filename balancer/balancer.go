@@ -23,7 +23,6 @@ type LoadBalancer struct {
 	Logger  *log.Logger
 	// TrustForwardedHeaders applies to servers added after it is set. See sv.Server.
 	TrustForwardedHeaders bool
-	shutdown              atomic.Bool
 	metrics               *Metrics
 	strategy              string
 	rotation              atomic.Uint64
@@ -175,11 +174,6 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	if lb.shutdown.Load() {
-		http.Error(w, "Service is shutting down", http.StatusServiceUnavailable)
-		return
-	}
-
 	// A failed dial closes the body on Go 1.23, where the stdlib does not guard it. Keep it open for a retry.
 	if r.Body != nil {
 		r.Body = io.NopCloser(r.Body)
@@ -249,12 +243,4 @@ func (lb *LoadBalancer) StartHealthChecks(interval time.Duration) {
 			}
 		}(server)
 	}
-}
-
-func (lb *LoadBalancer) GracefulShutdown() {
-	lb.Logger.Println(utils.Colorize("Shutting down load balancer gracefully", utils.YELLOW))
-
-	lb.shutdown.Store(true)
-
-	lb.Logger.Println(utils.Colorize("All servers have been shut down, and connections are closed.", utils.YELLOW))
 }

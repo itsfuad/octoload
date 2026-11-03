@@ -94,7 +94,7 @@ func TestRemoveServerNotFound(t *testing.T) {
 	}
 }
 
-// Run under -race: traffic, health checks, removal and shutdown all touch routing state.
+// Run under -race: traffic, health checks and removal all touch routing state.
 func TestRemoveServerReturnsUnderConstantTraffic(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		time.Sleep(2 * time.Millisecond)
@@ -140,7 +140,6 @@ func TestRemoveServerReturnsUnderConstantTraffic(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("RemoveServer did not return under constant traffic")
 	}
-	lb.GracefulShutdown()
 }
 
 func TestLeastActiveSpreadsTiesAcrossIdleServers(t *testing.T) {

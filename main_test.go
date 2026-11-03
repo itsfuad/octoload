@@ -1,16 +1,20 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/itsfuad/octoload/balancer"
 	"github.com/itsfuad/octoload/config"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -99,53 +103,222 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
-func TestGracefulShutdown(t *testing.T) {
-
-	// Create test load balancer
-	lb := balancer.NewLoadBalancer(nil, "round_robin")
-
-	// Create shutdown channel
-	shutdown := make(chan struct{})
-	done := make(chan struct{})
-
-	// Start test server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-shutdown:
-			// Simulate graceful shutdown
-			time.Sleep(100 * time.Millisecond)
-			w.WriteHeader(http.StatusServiceUnavailable)
-		default:
-			w.WriteHeader(http.StatusOK)
-		}
-	}))
-	defer server.Close()
-
-	// Add test server to load balancer
-	err := lb.AddServer(server.URL)
+// startServe runs serve on an ephemeral port and returns its address and result.
+func startServe(t *testing.T, ctx context.Context, handler http.Handler, delay, timeout time.Duration) (string, <-chan error) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("Failed to add server: %v", err)
+		t.Fatalf("Listen: %v", err)
 	}
+	result := make(chan error, 1)
+	go func() { result <- serve(ctx, listener, handler, delay, timeout) }()
+	return "http://" + listener.Addr().String(), result
+}
 
-	// Start shutdown process in goroutine
-	go func() {
-		close(shutdown)
-		lb.GracefulShutdown()
-		close(done)
-	}()
-
-	// Wait for shutdown with timeout
+func waitForServe(t *testing.T, result <-chan error) error {
+	t.Helper()
 	select {
-	case <-done:
-		// Shutdown completed successfully
-	case <-time.After(5 * time.Second):
-		t.Fatal("Shutdown timeout")
+	case err := <-result:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve did not return")
+		return nil
+	}
+}
+
+// newBlockingLB returns a balancer whose backend writes "partial", signals started,
+// then finishes with "done" only once release is called. Cleanup releases it first
+// so a failing test cannot hang closing the backend.
+func newBlockingLB(t *testing.T) (lb *balancer.LoadBalancer, started chan struct{}, release func()) {
+	t.Helper()
+	started = make(chan struct{}, 8)
+	unblock := make(chan struct{})
+	release = sync.OnceFunc(func() { close(unblock) })
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("partial"))
+		w.(http.Flusher).Flush()
+		started <- struct{}{}
+		<-unblock
+		w.Write([]byte("done"))
+	}))
+	t.Cleanup(backend.Close)
+	t.Cleanup(release)
+	lb = balancer.NewLoadBalancer(nil, "round_robin")
+	if err := lb.AddServer(backend.URL); err != nil {
+		t.Fatalf("AddServer: %v", err)
+	}
+	return lb, started, release
+}
+
+func waitUntilRefused(t *testing.T, url string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.Dial("tcp", strings.TrimPrefix(url, "http://"))
+		if err != nil {
+			return
+		}
+		conn.Close()
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("listener still accepting new connections")
+}
+
+// Regression: a stop signal called os.Exit(0), killing every in-flight request.
+func TestServeDrainsInFlightRequests(t *testing.T) {
+	lb, started, release := newBlockingLB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	url, result := startServe(t, ctx, lb, 0, 10*time.Second)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	<-started
+
+	cancel()
+	waitUntilRefused(t, url)
+	select {
+	case err := <-result:
+		t.Fatalf("serve returned with a request in flight: %v", err)
+	default:
 	}
 
-	// Verify server is not accepting new requests
-	resp, err := http.Get(server.URL)
-	if err == nil && resp.StatusCode != http.StatusServiceUnavailable {
-		t.Error("Expected server to reject requests after shutdown")
+	release()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || string(body) != "partialdone" {
+		t.Fatalf("body = %q, err = %v, want complete response", body, err)
+	}
+	if err := waitForServe(t, result); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+}
+
+func TestServeKeepsAcceptingDuringShutdownDelay(t *testing.T) {
+	const delay = 500 * time.Millisecond
+	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(backend.Close)
+	lb := balancer.NewLoadBalancer(nil, "round_robin")
+	if err := lb.AddServer(backend.URL); err != nil {
+		t.Fatalf("AddServer: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	url, result := startServe(t, ctx, lb, delay, 5*time.Second)
+
+	// Prove the server is up before starting the delay.
+	first, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET before cancel: %v", err)
+	}
+	first.Body.Close()
+
+	cancel()
+	// A fresh connection: a kept-alive one would not prove the listener is open.
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := client.Get(url)
+	if err != nil {
+		t.Fatalf("GET during delay: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status during delay = %d, want 200", resp.StatusCode)
+	}
+
+	if err := waitForServe(t, result); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	waitUntilRefused(t, url)
+}
+
+func TestServeReportsDrainTimeout(t *testing.T) {
+	lb, started, _ := newBlockingLB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	url, result := startServe(t, ctx, lb, 0, 50*time.Millisecond)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	<-started
+
+	cancel()
+	if err := waitForServe(t, result); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("serve = %v, want drain deadline exceeded", err)
+	}
+}
+
+func TestServeReportsListenerFailure(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	listener.Close()
+
+	result := make(chan error, 1)
+	go func() { result <- serve(context.Background(), listener, http.NotFoundHandler(), 0, time.Second) }()
+	if err := waitForServe(t, result); err == nil {
+		t.Fatal("expected error from closed listener")
+	}
+}
+
+// Regression: http.ListenAndServe has no timeouts, so slow clients held connections forever.
+func TestServeDropsClientsThatStallSendingHeaders(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for the real 10s ReadHeaderTimeout")
+	}
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	url, _ := startServe(t, ctx, http.NotFoundHandler(), 0, time.Second)
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(url, "http://"))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("GET / HTTP/1.1\r\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	if _, err := io.ReadAll(conn); err != nil {
+		t.Fatalf("connection was not closed by the server: %v", err)
+	}
+}
+
+func TestLoadConfigShutdownSettings(t *testing.T) {
+	tests := []struct {
+		name                string
+		settings            string
+		wantDelay, wantWait int
+	}{
+		{"defaults when missing", ``, 5, 30},
+		{"explicit values", `"shutdown_delay_seconds": 1, "shutdown_timeout_seconds": 2`, 1, 2},
+		{"explicit zero delay is kept", `"shutdown_delay_seconds": 0`, 0, 30},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "servers.json")
+			if err := os.WriteFile(path, []byte(`{"load_balancer": {`+tt.settings+`}}`), 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			cfg, err := config.LoadConfig(path)
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			if got := cfg.LoadBalancer.ShutdownDelaySeconds; got != tt.wantDelay {
+				t.Errorf("delay = %d, want %d", got, tt.wantDelay)
+			}
+			if got := cfg.LoadBalancer.ShutdownTimeoutSeconds; got != tt.wantWait {
+				t.Errorf("timeout = %d, want %d", got, tt.wantWait)
+			}
+		})
 	}
 }
 

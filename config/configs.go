@@ -12,6 +12,10 @@ type Config struct {
 		Strategy                   string `json:"strategy"` // "least_active" or "round_robin"
 		// TrustForwardedHeaders keeps inbound X-Forwarded-*. Enable only behind a trusted edge.
 		TrustForwardedHeaders bool `json:"trust_forwarded_headers"`
+		// ShutdownDelaySeconds keeps serving after a stop signal so external load
+		// balancers can stop routing here. ShutdownTimeoutSeconds then bounds the drain.
+		ShutdownDelaySeconds   int `json:"shutdown_delay_seconds"`
+		ShutdownTimeoutSeconds int `json:"shutdown_timeout_seconds"`
 	} `json:"load_balancer"`
 	Servers struct {
 		URLs []string `json:"urls"`
@@ -32,6 +36,9 @@ func LoadConfig(filenames ...string) (*Config, error) {
 	defer file.Close()
 
 	config := &Config{}
+	// Set before decoding so an explicit 0 in the file stays distinct from a missing field.
+	config.LoadBalancer.ShutdownDelaySeconds = 5
+	config.LoadBalancer.ShutdownTimeoutSeconds = 30
 	if err := json.NewDecoder(file).Decode(config); err != nil {
 		return nil, err
 	}
