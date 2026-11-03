@@ -7,7 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,34 +16,23 @@ var client = &http.Client{Timeout: 30 * time.Second}
 
 type Server struct {
 	URL     string
-	Load    int
-	Healthy bool
-	mu      sync.RWMutex
+	Load    atomic.Int64
+	Healthy atomic.Bool
 	logger  *log.Logger
 }
 
 func NewServer(url string, logger *log.Logger) *Server {
-	return &Server{
-		URL:     url,
-		Healthy: true,
-		logger:  logger,
-	}
+	s := &Server{URL: url, logger: logger}
+	s.Healthy.Store(true)
+	return s
 }
 
 func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) error {
-	s.mu.Lock()
-	if !s.Healthy {
-		s.mu.Unlock()
+	if !s.Healthy.Load() {
 		return fmt.Errorf("server %s is not healthy", s.URL)
 	}
-	s.Load++
-	s.mu.Unlock()
-
-	defer func() {
-		s.mu.Lock()
-		s.Load--
-		s.mu.Unlock()
-	}()
+	s.Load.Add(1)
+	defer s.Load.Add(-1)
 
 	var bodyBytes []byte
 	var err error
@@ -83,13 +72,11 @@ func (s *Server) CheckHealth() {
 	if err == nil {
 		resp.Body.Close()
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if err != nil || resp.StatusCode != http.StatusOK {
-		s.Healthy = false
+		s.Healthy.Store(false)
 		s.logger.Println(utils.Colorize(fmt.Sprintf("Server %s is unhealthy\n", s.URL), utils.RED))
 	} else {
-		s.Healthy = true
+		s.Healthy.Store(true)
 	}
 }

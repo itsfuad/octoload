@@ -17,7 +17,7 @@ func TestNewServer(t *testing.T) {
 	if server.URL != URL {
 		t.Errorf("expected URL to be 'http://example.com', got %s", server.URL)
 	}
-	if !server.Healthy {
+	if !server.Healthy.Load() {
 		t.Errorf("expected server to be healthy")
 	}
 	if server.logger != logger {
@@ -37,7 +37,7 @@ func TestHandleRequest(t *testing.T) {
 		t.Errorf("expected error due to server being unreachable")
 	}
 
-	server.Healthy = false
+	server.Healthy.Store(false)
 	err = server.HandleRequest(w, req)
 	if err == nil {
 		t.Errorf("expected error due to server being unhealthy")
@@ -49,7 +49,7 @@ func TestCheckHealth(t *testing.T) {
 	server := NewServer("http://example.com", logger)
 
 	server.CheckHealth()
-	if !server.Healthy {
+	if !server.Healthy.Load() {
 		t.Errorf("expected server to be healthy")
 	}
 }
