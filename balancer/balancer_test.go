@@ -276,6 +276,7 @@ func TestFailureClassification(t *testing.T) {
 		{name: "no ports is our problem", method: http.MethodPost, err: dial(syscall.EADDRNOTAVAIL), wantRetry: true},
 		{name: "reset GET", method: http.MethodGet, err: reset, wantRetry: true},
 		{name: "reset POST", method: http.MethodPost, err: reset},
+		{name: "timed out GET may still be running", method: http.MethodGet, err: fmt.Errorf("proxy: %w", &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded})},
 		{name: "failed upgrade may be hijacked", method: http.MethodGet, upgrade: "websocket", err: errors.New("response write: broken pipe")},
 		{name: "unhealthy POST", method: http.MethodPost, err: sv.ErrUnhealthy, wantRetry: true},
 	}
@@ -290,6 +291,23 @@ func TestFailureClassification(t *testing.T) {
 			}
 			if got := provesBackendDown(tt.err); got != tt.wantBackendDn {
 				t.Errorf("provesBackendDown = %v, want %v", got, tt.wantBackendDn)
+			}
+		})
+	}
+}
+
+func TestSelectionSkipsExcludedServers(t *testing.T) {
+	for _, strategy := range []string{StrategyRoundRobin, StrategyLeastActive} {
+		t.Run(strategy, func(t *testing.T) {
+			lb := newTestBalancer(t, strategy, "http://a", "http://b")
+			a, b := lb.Servers[0], lb.Servers[1]
+			for range 4 {
+				if got := lb.GetServer(a); got != b {
+					t.Fatalf("GetServer(a) = %v, want b", got.URL)
+				}
+			}
+			if got := lb.GetServer(a, b); got != nil {
+				t.Fatalf("GetServer(a, b) = %v, want nil", got.URL)
 			}
 		})
 	}

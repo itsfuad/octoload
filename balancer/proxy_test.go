@@ -518,6 +518,61 @@ func TestConnectionResetRetriesOnlySafeMethods(t *testing.T) {
 	}
 }
 
+// A backend that fails fast looks idle, so least active prefers it on every attempt.
+func TestRetryMovesToAnotherBackend(t *testing.T) {
+	var resetHits, otherHits atomic.Int32
+	reset := newResetBackend(t, &resetHits)
+	other := newBackend(t, func(http.ResponseWriter, *http.Request) { otherHits.Add(1) })
+	lb := newTestBalancer(t, StrategyLeastActive, reset.URL, other.URL)
+	lb.Servers[1].Load.Add(1) // Keeps the healthy backend looking busier.
+	frontend := newFrontend(t, lb)
+
+	const requests = 5
+	for range requests {
+		if resp := mustDo(t, mustRequest(t, http.MethodGet, frontend.URL, nil)); resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+	}
+	if resetHits.Load() != requests || otherHits.Load() != requests {
+		t.Fatalf("reset backend hit %d times, other %d, want %d each", resetHits.Load(), otherHits.Load(), requests)
+	}
+}
+
+func TestRetryNeverRepeatsOnlyBackend(t *testing.T) {
+	var hits atomic.Int32
+	frontend := newFrontend(t, newTestBalancer(t, StrategyRoundRobin, newResetBackend(t, &hits).URL))
+
+	resp := mustDo(t, mustRequest(t, http.MethodGet, frontend.URL, nil))
+	if resp.StatusCode != http.StatusBadGateway || hits.Load() != 1 {
+		t.Fatalf("status = %d, hits = %d, want 502 after 1 attempt", resp.StatusCode, hits.Load())
+	}
+}
+
+func TestAcceptEncodingIsForwardedUnchanged(t *testing.T) {
+	for _, want := range []string{"", "gzip"} {
+		t.Run("client sent "+want, func(t *testing.T) {
+			got := make(chan string, 1)
+			backend := newBackend(t, func(_ http.ResponseWriter, r *http.Request) { got <- r.Header.Get("Accept-Encoding") })
+			frontend := newFrontend(t, newTestBalancer(t, StrategyRoundRobin, backend.URL))
+
+			req := mustRequest(t, http.MethodGet, frontend.URL, nil)
+			if want != "" {
+				req.Header.Set("Accept-Encoding", want)
+			}
+			client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+			defer client.CloseIdleConnections()
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if seen := <-got; seen != want {
+				t.Errorf("backend saw Accept-Encoding %q, want %q", seen, want)
+			}
+		})
+	}
+}
+
 func TestBackendErrorStatusIsNotRetried(t *testing.T) {
 	var hits atomic.Int32
 	backend := newBackend(t, func(w http.ResponseWriter, _ *http.Request) {

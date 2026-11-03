@@ -116,7 +116,7 @@ func TestAdminEndpoints(t *testing.T) {
 	expect("healthy", http.StatusOK, http.StatusOK)
 
 	lb.Servers[0].Healthy.Store(false)
-	expect("backend outage must not restart the balancer", http.StatusOK, http.StatusServiceUnavailable)
+	expect("backend outage must neither restart nor unready the balancer", http.StatusOK, http.StatusOK)
 
 	lb.Servers[0].Healthy.Store(true)
 	draining.Store(true)

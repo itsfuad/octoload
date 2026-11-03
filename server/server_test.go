@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,10 +51,36 @@ func TestNewServerAcceptsNilLogger(t *testing.T) {
 }
 
 func TestNewServerRejectsInvalidURLs(t *testing.T) {
-	for _, rawURL := range []string{"", "not a url", "localhost:8001", "ftp://host", "http://", "http://a b", "http://a?x=1"} {
+	for _, rawURL := range []string{"", "not a url", "localhost:8001", "ftp://host", "http://", "http://a b", "http://a?x=1", "http://a?", "http://a#frag", "http://a#", "http://user@a"} {
 		if _, err := NewServer(rawURL, nil, Options{}); err == nil {
 			t.Errorf("NewServer(%q): expected error", rawURL)
 		}
+	}
+}
+
+func TestParseURLErrorHidesPassword(t *testing.T) {
+	for _, rawURL := range []string{"http://user:s3cret@host", "http://user:s3cret x@host"} {
+		_, err := ParseURL(rawURL)
+		if err == nil || strings.Contains(err.Error(), "s3cret") {
+			t.Errorf("ParseURL(%q): err = %v, want an error without the password", rawURL, err)
+		}
+	}
+}
+
+// balancer.canRetry relies on this error reporting itself as a timeout.
+func TestHungBackendReportsTimeoutError(t *testing.T) {
+	saved := transport
+	transport = saved.Clone()
+	transport.ResponseHeaderTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { transport = saved })
+
+	backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	t.Cleanup(backend.Close)
+
+	err := newTestServer(t, backend.URL, Options{}).HandleRequest(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("err = %v, want a timeout", err)
 	}
 }
 

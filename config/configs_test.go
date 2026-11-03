@@ -57,6 +57,8 @@ func TestLoadConfigRejectsBadFiles(t *testing.T) {
 	}{
 		{"missing file", filepath.Join(t.TempDir(), "missing.json"), "reading config"},
 		{"malformed JSON", writeConfig(t, `{`), "parsing config"},
+		{"stray brace after the object", writeConfig(t, validWith("")+` }`), "after the JSON object"},
+		{"second object", writeConfig(t, validWith("")+` {"load_balancer": {"port": 1}}`), "after the JSON object"},
 		{"misspelled option", writeConfig(t, validWith(`, "stratgy": "x"`)), `unknown field "stratgy"`},
 		{"invalid values", writeConfig(t, validWith(`, "port": 0`)), "port must be"},
 	}
@@ -66,6 +68,12 @@ func TestLoadConfigRejectsBadFiles(t *testing.T) {
 				t.Fatalf("err = %v, want it to contain %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestLoadConfigAllowsTrailingWhitespace(t *testing.T) {
+	if _, err := LoadConfig(writeConfig(t, validWith("")+"\n\n")); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -116,6 +124,14 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("err = %v, want it to contain %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestValidateHidesPasswords(t *testing.T) {
+	var cfg Config
+	cfg.Servers.URLs = []string{"http://u:s3cret@h", "http://u:s3cret@h", "http://u:s3cret x@h"}
+	if err := cfg.Validate(); err == nil || strings.Contains(err.Error(), "s3cret") {
+		t.Fatalf("err = %v, want an error without the password", err)
 	}
 }
 

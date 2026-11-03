@@ -83,7 +83,7 @@ Always call `StartHealthChecks`: it is the only thing that restores a backend ej
 | `shutdown_timeout_seconds` | `30` | Limit for draining in-flight requests. Keep this above 5: Go waits up to 5s for client connections that have not sent a request, so a lower value can report a failed drain with nothing in flight. |
 | `trust_forwarded_headers` | `false` | Keep inbound `X-Forwarded-*` values. See [Deployment](#deployment). |
 
-`servers.urls` needs at least one `http` or `https` URL, with no duplicates. Each may include a base path. Unknown options are errors.
+`servers.urls` needs at least one `http` or `https` URL, with no duplicates. Each may include a base path, but no credentials, query or fragment. Unknown options and anything after the JSON object are errors.
 
 ## How failures are handled
 
@@ -95,10 +95,11 @@ Failed requests follow this rule. Only bodyless `GET`, `HEAD` and `OPTIONS` requ
 |---|---|---|
 | Connection refused | Yes, any method | Yes |
 | Other connection failure (timeout, balancer out of file descriptors or ports) | Yes, any method | No, this can be overload or a local problem |
-| Reset or timeout before response headers | Only `GET`, `HEAD` and `OPTIONS` with no body, and not upgrades | No |
+| Reset before response headers | Only `GET`, `HEAD` and `OPTIONS` with no body, and not upgrades | No |
+| Timeout after connecting, such as no response headers in 30s | Never. The backend may still be working, and repeating it adds load. | No |
 | Response already started | Never. The client connection is aborted, so the client sees a truncated response. | No |
 
-A backend's 5xx response is passed through and not retried. After up to 3 attempts, the client gets `502`. With no healthy backend it gets `503`.
+A backend's 5xx response is passed through and not retried. A retry never returns to a backend already tried for that request, so with one backend there is no retry. After up to 3 attempts, the client gets `502`. With no healthy backend it gets `503`.
 
 Timeouts are 5s to connect and 30s for backend response headers. Once a response starts there is no limit, so downloads and streams can run as long as they need. Clients get 10s to send request headers, and idle connections close after 120s.
 
@@ -111,7 +112,7 @@ Requests reach backends with the client's `Host`, `X-Forwarded-For`, `X-Forwarde
 | Endpoint | Purpose |
 |---|---|
 | `GET /livez` | Always `200` while the process runs. Use for liveness: a backend outage must not restart the balancer. |
-| `GET /readyz` | `503` while draining or with no healthy backend. Use for readiness. |
+| `GET /readyz` | `503` while draining. Use for readiness. It ignores backends: an outage must not pull every balancer out of service, so clients get a clear `503` from the balancer. Watch backend state in `/metrics`. |
 | `GET /metrics` | JSON counters and per-backend state. |
 
 ```json
@@ -166,6 +167,7 @@ DynamicUser=yes
 - Configuration is read at startup. Restart to change it.
 - No weighted, sticky or IP hash strategies.
 - Unsafe requests are not retried after a connection reset, so clients must handle `502`.
+- Endpoints that take over 30s to send response headers get `502`. The limit is not configurable.
 - On Windows, a refused connection probably does not eject a backend immediately, so it waits for health checks. Retries still work. Windows is compiled for releases but not tested.
 
 ## Quick start with demo servers

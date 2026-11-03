@@ -31,6 +31,7 @@ var transport = func() *http.Transport {
 	t.ResponseHeaderTimeout = 30 * time.Second // Bounds hung backends without capping long responses.
 	t.MaxIdleConns = 0                         // The default total of 100 would cap the per-host limit.
 	t.MaxIdleConnsPerHost = 100                // The default of 2 churns connections under load.
+	t.DisableCompression = true                // Otherwise backends compress what the balancer then decompresses.
 	return t
 }()
 
@@ -62,9 +63,15 @@ type Server struct {
 func ParseURL(rawURL string) (*url.URL, error) {
 	target, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid server URL %q: %w", rawURL, err)
+		// url.Parse errors repeat the whole URL, which may hold a password.
+		return nil, fmt.Errorf("invalid server URL: %w", errors.Unwrap(err))
 	}
-	if (target.Scheme != "http" && target.Scheme != "https") || target.Host == "" || target.RawQuery != "" {
+	// Proxied requests never send URL credentials, and they would leak through logs and /metrics.
+	if target.User != nil {
+		return nil, fmt.Errorf("invalid server URL %q: credentials are not supported", target.Redacted())
+	}
+	// A query or fragment would swallow the health check path appended to this URL.
+	if (target.Scheme != "http" && target.Scheme != "https") || target.Host == "" || strings.ContainsAny(rawURL, "?#") {
 		return nil, fmt.Errorf("invalid server URL %q: want http(s)://host[:port][/path]", rawURL)
 	}
 	return target, nil

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/itsfuad/octoload/balancer"
@@ -48,6 +49,10 @@ func LoadConfig(path string) (*Config, error) {
 	if err := decoder.Decode(config); err != nil {
 		return nil, fmt.Errorf("parsing config %s: %w", path, err)
 	}
+	// Decode stops after one value, so settings in leftover text would silently do nothing.
+	if _, err := decoder.Token(); err != io.EOF {
+		return nil, fmt.Errorf("parsing config %s: unexpected data after the JSON object", path)
+	}
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config %s:\n%w", path, err)
 	}
@@ -78,7 +83,7 @@ func (c *Config) Validate() error {
 	for _, url := range c.Servers.URLs {
 		_, err := sv.ParseURL(url)
 		errs = append(errs, err)
-		require(!seen[url], "duplicate server URL %q", url)
+		require(err != nil || !seen[url], "duplicate server URL %q", url) // Only valid URLs are safe to print.
 		seen[url] = true
 	}
 	return errors.Join(errs...)

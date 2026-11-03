@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"slices"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -152,12 +151,11 @@ func newAdminMux(lb *balancer.LoadBalancer, draining *atomic.Bool) *http.ServeMu
 	})
 	// Liveness ignores backends: an outage behind the balancer must not restart it.
 	mux.HandleFunc("GET /livez", func(http.ResponseWriter, *http.Request) {})
+	// Readiness ignores backends too: an outage would pull every balancer at once,
+	// so clients would get connection errors instead of a clear 503.
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
-		switch {
-		case draining.Load():
+		if draining.Load() {
 			http.Error(w, "draining", http.StatusServiceUnavailable)
-		case !slices.ContainsFunc(lb.GetMetrics().Backends, func(b balancer.BackendMetrics) bool { return b.Healthy }):
-			http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
 		}
 	})
 	return mux

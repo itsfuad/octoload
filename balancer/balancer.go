@@ -86,9 +86,6 @@ func (lb *LoadBalancer) AddServer(url string) error {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
 
-	if url == "" {
-		return errors.New("server URL cannot be empty")
-	}
 	if slices.ContainsFunc(lb.Servers, func(s *sv.Server) bool { return s.URL == url }) {
 		return fmt.Errorf("server %s already exists", url)
 	}
@@ -149,7 +146,7 @@ func (lb *LoadBalancer) GetMetrics() *Metrics {
 	}
 }
 
-func (lb *LoadBalancer) GetLeastLoadedServer() *sv.Server {
+func (lb *LoadBalancer) GetLeastLoadedServer(exclude ...*sv.Server) *sv.Server {
 	lb.mu.RLock()
 	defer lb.mu.RUnlock()
 
@@ -159,7 +156,7 @@ func (lb *LoadBalancer) GetLeastLoadedServer() *sv.Server {
 	start := lb.rotation.Add(1) - 1
 	for i := range lb.Servers {
 		server := lb.Servers[(start+uint64(i))%uint64(len(lb.Servers))]
-		if !server.Healthy.Load() {
+		if !server.Healthy.Load() || slices.Contains(exclude, server) {
 			continue
 		}
 		if load := server.Load.Load(); leastLoadedServer == nil || load < leastLoad {
@@ -170,13 +167,13 @@ func (lb *LoadBalancer) GetLeastLoadedServer() *sv.Server {
 	return leastLoadedServer
 }
 
-func (lb *LoadBalancer) GetRoundRobinServer() *sv.Server {
+func (lb *LoadBalancer) GetRoundRobinServer(exclude ...*sv.Server) *sv.Server {
 	lb.mu.RLock()
 	defer lb.mu.RUnlock()
 
 	var healthyServers []*sv.Server
 	for _, server := range lb.Servers {
-		if server.Healthy.Load() {
+		if server.Healthy.Load() && !slices.Contains(exclude, server) {
 			healthyServers = append(healthyServers, server)
 		}
 	}
@@ -188,11 +185,12 @@ func (lb *LoadBalancer) GetRoundRobinServer() *sv.Server {
 	return healthyServers[(lb.rotation.Add(1)-1)%uint64(len(healthyServers))]
 }
 
-func (lb *LoadBalancer) GetServer() *sv.Server {
+// GetServer picks a healthy server other than those in exclude, or nil if none is left.
+func (lb *LoadBalancer) GetServer(exclude ...*sv.Server) *sv.Server {
 	if lb.strategy == StrategyRoundRobin {
-		return lb.GetRoundRobinServer()
+		return lb.GetRoundRobinServer(exclude...)
 	}
-	return lb.GetLeastLoadedServer()
+	return lb.GetLeastLoadedServer(exclude...)
 }
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -216,11 +214,15 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := http.StatusServiceUnavailable
+	// Excluded because a backend that fails fast looks idle, so least active would
+	// otherwise keep choosing it while healthy backends go unused.
+	var tried []*sv.Server
 	for retry := range maxRetries {
-		server := lb.GetServer()
+		server := lb.GetServer(tried...)
 		if server == nil {
 			break
 		}
+		tried = append(tried, server)
 
 		err := server.HandleRequest(w, r)
 		if err == nil {
@@ -254,6 +256,11 @@ func canRetry(r *http.Request, err error) bool {
 	}
 	// A failed upgrade may have already hijacked the client connection.
 	if r.Header.Get("Upgrade") != "" || r.ContentLength != 0 {
+		return false
+	}
+	// A backend that timed out may still be working: repeating it adds load when it can least take it.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		return false
 	}
 	return r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions
