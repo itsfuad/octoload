@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	sv "github.com/itsfuad/octoload/server"
@@ -16,14 +18,16 @@ import (
 )
 
 type LoadBalancer struct {
-	Servers      []*sv.Server
-	mu           sync.RWMutex
-	Logger       *log.Logger
-	shutdown     atomic.Bool
-	metrics      *Metrics
-	strategy     string
-	rotation     atomic.Uint64
-	drainTimeout time.Duration
+	Servers []*sv.Server
+	mu      sync.RWMutex
+	Logger  *log.Logger
+	// TrustForwardedHeaders applies to servers added after it is set. See sv.Server.
+	TrustForwardedHeaders bool
+	shutdown              atomic.Bool
+	metrics               *Metrics
+	strategy              string
+	rotation              atomic.Uint64
+	drainTimeout          time.Duration
 }
 
 const (
@@ -60,7 +64,11 @@ func (lb *LoadBalancer) AddServer(url string) error {
 		return fmt.Errorf("server %s already exists", url)
 	}
 
-	server := sv.NewServer(url, lb.Logger)
+	server, err := sv.NewServer(url, lb.Logger)
+	if err != nil {
+		return err
+	}
+	server.TrustForwardedHeaders = lb.TrustForwardedHeaders
 	lb.Servers = append(lb.Servers, server)
 	lb.Logger.Println(utils.Colorize("Added server "+url+" to the load balancer", utils.GREEN))
 	return nil
@@ -157,27 +165,76 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&lb.metrics.ActiveConnections, 1)
 	defer atomic.AddInt64(&lb.metrics.ActiveConnections, -1)
 
+	// A response that dies midway surfaces as a panic that net/http handles.
+	defer func() {
+		if p := recover(); p != nil {
+			if r.Context().Err() == nil {
+				atomic.AddUint64(&lb.metrics.FailedRequests, 1)
+			}
+			panic(p)
+		}
+	}()
+
 	if lb.shutdown.Load() {
 		http.Error(w, "Service is shutting down", http.StatusServiceUnavailable)
 		return
 	}
 
+	// A failed dial closes the body on Go 1.23, where the stdlib does not guard it. Keep it open for a retry.
+	if r.Body != nil {
+		r.Body = io.NopCloser(r.Body)
+	}
+
+	status := http.StatusServiceUnavailable
 	for retry := range maxRetries {
 		server := lb.GetServer()
 		if server == nil {
-			continue
+			break
 		}
 
 		err := server.HandleRequest(w, r)
 		if err == nil {
 			return
 		}
+		if r.Context().Err() != nil {
+			return // Client is gone: not a backend failure, and nobody to answer.
+		}
 
 		lb.Logger.Printf("Request failed on server %s, attempt %d: %v", server.URL, retry+1, err)
+		status = http.StatusBadGateway
+		if provesBackendDown(err) {
+			server.Healthy.Store(false)
+		}
+		if !canRetry(r, err) {
+			break
+		}
 	}
 
 	atomic.AddUint64(&lb.metrics.FailedRequests, 1)
-	http.Error(w, "All servers failed to process the request", http.StatusServiceUnavailable)
+	http.Error(w, http.StatusText(status), status)
+}
+
+// canRetry reports whether another attempt is safe: it must never repeat a
+// request that a backend may have acted on, or need a body already consumed.
+func canRetry(r *http.Request, err error) bool {
+	// The request never left, so any method is safe and the body is still unread.
+	var opErr *net.OpError
+	if errors.Is(err, sv.ErrUnhealthy) || (errors.As(err, &opErr) && opErr.Op == "dial") {
+		return true
+	}
+	// A failed upgrade may have already hijacked the client connection.
+	if r.Header.Get("Upgrade") != "" || r.ContentLength != 0 {
+		return false
+	}
+	return r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions
+}
+
+// provesBackendDown reports whether err alone justifies ejecting a backend until
+// its next health check. A refused connection means nothing is listening. Resets
+// and dial timeouts can be overload, and running out of file descriptors or ports
+// is the balancer's own problem: ejecting on those could cascade into an outage.
+func provesBackendDown(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
 func (lb *LoadBalancer) StartHealthChecks(interval time.Duration) {

@@ -1,13 +1,20 @@
 package balancer
 
 import (
+	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+
+	sv "github.com/itsfuad/octoload/server"
 )
 
 func newTestBalancer(t *testing.T, strategy string, urls ...string) *LoadBalancer {
@@ -179,6 +186,44 @@ func TestRoundRobinOrderSkipsUnhealthy(t *testing.T) {
 		if url == "http://b" {
 			t.Fatal("selected unhealthy server")
 		}
+	}
+}
+
+func TestFailureClassification(t *testing.T) {
+	dial := func(cause error) error { return fmt.Errorf("proxy: %w", &net.OpError{Op: "dial", Err: cause}) }
+	reset := &net.OpError{Op: "read", Err: syscall.ECONNRESET}
+
+	tests := []struct {
+		name          string
+		method        string
+		upgrade       string
+		err           error
+		wantRetry     bool
+		wantBackendDn bool
+	}{
+		{name: "refused POST", method: http.MethodPost, err: dial(syscall.ECONNREFUSED), wantRetry: true, wantBackendDn: true},
+		{name: "refused upgrade", method: http.MethodGet, upgrade: "websocket", err: dial(syscall.ECONNREFUSED), wantRetry: true, wantBackendDn: true},
+		{name: "dial timeout may be overload", method: http.MethodPost, err: dial(os.ErrDeadlineExceeded), wantRetry: true},
+		{name: "no file descriptors is our problem", method: http.MethodPost, err: dial(syscall.EMFILE), wantRetry: true},
+		{name: "no ports is our problem", method: http.MethodPost, err: dial(syscall.EADDRNOTAVAIL), wantRetry: true},
+		{name: "reset GET", method: http.MethodGet, err: reset, wantRetry: true},
+		{name: "reset POST", method: http.MethodPost, err: reset},
+		{name: "failed upgrade may be hijacked", method: http.MethodGet, upgrade: "websocket", err: errors.New("response write: broken pipe")},
+		{name: "unhealthy POST", method: http.MethodPost, err: sv.ErrUnhealthy, wantRetry: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(tt.method, "/", nil)
+			if tt.upgrade != "" {
+				r.Header.Set("Upgrade", tt.upgrade)
+			}
+			if got := canRetry(r, tt.err); got != tt.wantRetry {
+				t.Errorf("canRetry = %v, want %v", got, tt.wantRetry)
+			}
+			if got := provesBackendDown(tt.err); got != tt.wantBackendDn {
+				t.Errorf("provesBackendDown = %v, want %v", got, tt.wantBackendDn)
+			}
+		})
 	}
 }
 

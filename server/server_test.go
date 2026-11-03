@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -12,7 +13,10 @@ const URL = "http://example.com"
 
 func TestNewServer(t *testing.T) {
 	logger := log.New(io.Discard, "", log.LstdFlags)
-	server := NewServer(URL, logger)
+	server, err := NewServer(URL, logger)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
 
 	if server.URL != URL {
 		t.Errorf("expected URL to be 'http://example.com', got %s", server.URL)
@@ -25,28 +29,45 @@ func TestNewServer(t *testing.T) {
 	}
 }
 
-func TestHandleRequest(t *testing.T) {
-	logger := log.New(io.Discard, "", log.LstdFlags)
-	server := NewServer(URL, logger)
+func TestNewServerRejectsInvalidURLs(t *testing.T) {
+	for _, rawURL := range []string{"", "not a url", "localhost:8001", "ftp://host", "http://", "http://a b", "http://a?x=1"} {
+		if _, err := NewServer(rawURL, nil); err == nil {
+			t.Errorf("NewServer(%q): expected error", rawURL)
+		}
+	}
+}
 
-	req := httptest.NewRequest(http.MethodGet, URL, nil)
+func TestHandleRequest(t *testing.T) {
+	dead := httptest.NewServer(http.NotFoundHandler())
+	dead.Close()
+
+	server, err := NewServer(dead.URL, log.New(io.Discard, "", log.LstdFlags))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
 
-	err := server.HandleRequest(w, req)
-	if err == nil {
-		t.Errorf("expected error due to server being unreachable")
+	if err := server.HandleRequest(w, req); err == nil || errors.Is(err, ErrUnhealthy) {
+		t.Errorf("expected connection error, got %v", err)
+	}
+	if server.Load.Load() != 0 {
+		t.Errorf("expected load to return to 0, got %d", server.Load.Load())
 	}
 
 	server.Healthy.Store(false)
-	err = server.HandleRequest(w, req)
-	if err == nil {
-		t.Errorf("expected error due to server being unhealthy")
+	if err := server.HandleRequest(w, req); !errors.Is(err, ErrUnhealthy) {
+		t.Errorf("expected ErrUnhealthy, got %v", err)
 	}
 }
 
 func TestCheckHealth(t *testing.T) {
 	logger := log.New(io.Discard, "", log.LstdFlags)
-	server := NewServer("http://example.com", logger)
+	server, err := NewServer("http://example.com", logger)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
 
 	server.CheckHealth()
 	if !server.Healthy.Load() {

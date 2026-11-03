@@ -24,8 +24,11 @@ func main() {
 	}
 
 	lb := balancer.NewLoadBalancer(logger, cfg.LoadBalancer.Strategy)
+	lb.TrustForwardedHeaders = cfg.LoadBalancer.TrustForwardedHeaders
 	for _, url := range cfg.Servers.URLs {
-		lb.AddServer(url)
+		if err := lb.AddServer(url); err != nil {
+			logger.Fatalf("Error adding server: %v\n", err)
+		}
 	}
 
 	lb.StartHealthChecks(time.Duration(cfg.LoadBalancer.HealthCheckIntervalSeconds) * time.Second)
