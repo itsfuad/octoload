@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -17,7 +16,7 @@ import (
 const URL = "http://example.com"
 
 func TestNewServer(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logger := slog.New(slog.DiscardHandler)
 	server, err := NewServer(URL, logger, Options{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -66,7 +65,7 @@ func TestHandleRequest(t *testing.T) {
 
 func newTestServer(t *testing.T, url string, options Options) *Server {
 	t.Helper()
-	server, err := NewServer(url, slog.New(slog.NewTextHandler(io.Discard, nil)), options)
+	server, err := NewServer(url, slog.New(slog.DiscardHandler), options)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}

@@ -6,44 +6,34 @@ on:
   pull_request:
     branches: [ "**" ]
 
+permissions:
+  contents: read
+
 jobs:
-  build-and-test:
+  test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # net/http behavior differs between releases, and retries depend on it.
+        # Keep the first entry in line with go.mod.
+        go-version: [ '1.26', 'stable' ]
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.23'
-
-      - name: Cache Dependencies
-        uses: actions/cache@v3
-        id: gomod-cache
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.mod') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
-      - name: Install Dependencies
-        run: go mod tidy
-
-      - name: Lint
-        run: |
-          go install golang.org/x/lint/golint@latest
-          golint ./...
+          go-version: ${{ matrix.go-version }}
 
       - name: Format Check
         run: |
-          unformatted=$(go fmt ./...)
+          unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
             echo "The following files are not formatted:"
             echo "$unformatted"
             exit 1
-          else
-            echo "Code is formatted."
           fi
 
       - name: Vet
@@ -54,3 +44,29 @@ jobs:
 
       - name: Test
         run: go test -race -v ./...
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Check for known vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build -t octoload:ci .
+
+      - name: Run image
+        run: docker run --rm octoload:ci -version

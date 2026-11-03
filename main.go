@@ -20,11 +20,20 @@ import (
 	sv "github.com/itsfuad/octoload/server"
 )
 
+// version is set at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	configPath := flag.String("config", "servers.json", "path to the configuration file")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	if err := run(*configPath, logger); err != nil {
 		logger.Error("load balancer failed", "error", err)
@@ -90,7 +99,7 @@ func run(configPath string, logger *slog.Logger) error {
 		}()
 	}
 
-	logger.Info("listening", "port", cfg.LoadBalancer.Port, "admin_port", cfg.LoadBalancer.AdminPort, "strategy", cfg.LoadBalancer.Strategy)
+	logger.Info("listening", "version", version, "port", cfg.LoadBalancer.Port, "admin_port", cfg.LoadBalancer.AdminPort, "strategy", cfg.LoadBalancer.Strategy)
 	shutdownDelay := time.Duration(cfg.LoadBalancer.ShutdownDelaySeconds) * time.Second
 	shutdownTimeout := time.Duration(cfg.LoadBalancer.ShutdownTimeoutSeconds) * time.Second
 	if err := serve(ctx, listener, lb, shutdownDelay, shutdownTimeout); err != nil {

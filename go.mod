@@ -1,3 +1,3 @@
 module github.com/itsfuad/octoload
 
-go 1.23.0
+go 1.26.0

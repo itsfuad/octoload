@@ -71,7 +71,7 @@ func NewLoadBalancer(logger *slog.Logger, strategy string) (*LoadBalancer, error
 		return nil, err
 	}
 	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		logger = slog.New(slog.DiscardHandler)
 	}
 	return &LoadBalancer{
 		Logger:           logger,
@@ -210,7 +210,7 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// A failed dial closes the body on Go 1.23, where the stdlib does not guard it. Keep it open for a retry.
+	// Whether a failed dial closes the body varies by Go release. Keep it open for a retry.
 	if r.Body != nil {
 		r.Body = io.NopCloser(r.Body)
 	}
