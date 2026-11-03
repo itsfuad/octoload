@@ -7,10 +7,12 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,28 +21,40 @@ import (
 type demoServer struct{ id, port int }
 
 // buildDemo compiles demo_server.go into bin and removes it when the test ends.
-func buildDemo(t *testing.T, bin string) {
+func buildDemo(t *testing.T) string {
 	t.Log("Building demo server...")
+	bin := filepath.Join(t.TempDir(), "demo_server")
 	if err := exec.Command("go", "build", "-o", bin, "demo_server.go").Run(); err != nil {
 		t.Fatalf("Failed to build demo server: %v", err)
 	}
-	t.Cleanup(func() { os.Remove(bin) })
+	return bin
+}
+
+// freePort lets tests run in parallel without fighting over fixed ports.
+func freePort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to find a free port: %v", err)
+	}
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).Port
 }
 
 // TestLoadBalancerWithDemoServers spawns real demo servers and tests load balancing
 func TestLoadBalancerWithDemoServers(t *testing.T) {
-	buildDemo(t, "demo_server.exe")
+	bin := buildDemo(t)
 
 	serverConfigs := []demoServer{
-		{id: 1, port: 9001},
-		{id: 2, port: 9002},
-		{id: 3, port: 9003},
+		{id: 1, port: freePort(t)},
+		{id: 2, port: freePort(t)},
+		{id: 3, port: freePort(t)},
 	}
 
 	// Start demo servers
 	var processes []*exec.Cmd
 	for _, cfg := range serverConfigs {
-		cmd := exec.Command("./demo_server.exe",
+		cmd := exec.Command(bin,
 			"-id", fmt.Sprintf("%d", cfg.id),
 			"-port", fmt.Sprintf("%d", cfg.port))
 		cmd.Stdout = os.Stdout
@@ -174,10 +188,11 @@ func verifyLoadDistribution(t *testing.T, strategy string, serverConfigs []demoS
 
 // TestDemoServerDirectly tests demo servers directly without load balancer
 func TestDemoServerDirectly(t *testing.T) {
-	buildDemo(t, "demo_server_test.exe")
+	bin := buildDemo(t)
+	port := freePort(t)
 
 	// Start a single demo server
-	cmd := exec.Command("./demo_server_test.exe", "-id", "99", "-port", "9099")
+	cmd := exec.Command(bin, "-id", "99", "-port", fmt.Sprintf("%d", port))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -190,7 +205,7 @@ func TestDemoServerDirectly(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// Test server endpoint
-	resp, err := http.Get("http://localhost:9099/")
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/", port))
 	if err != nil {
 		t.Fatalf("Failed to connect to demo server: %v", err)
 	}

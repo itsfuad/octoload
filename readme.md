@@ -1,356 +1,215 @@
 # Octoload
 
-## Overview
-This project is a Go-based load balancer designed to distribute incoming HTTP requests to a pool of backend servers. It supports multiple load balancing strategies, health monitoring, and graceful shutdown capabilities, making it robust and scalable for production use.
+An HTTP load balancer in Go, using only the standard library. It distributes requests across backend servers, routes around failures, and drains in-flight requests on shutdown.
 
 ![logo](cover.png)
 
 ## Features
-- **Multiple Load Balancing Strategies:**
-  - **Round Robin:** Distributes requests evenly across all healthy servers in a circular fashion
-  - **Least Active:** Routes requests to the server with the fewest active connections
-- **Health Checks:** Regularly checks the health of each server and only routes traffic to healthy servers
-- **Graceful Shutdown:** Ensures that ongoing requests are handled before shutting down the load balancer
-- **Configuration via JSON:** Server details and settings are loaded from a JSON configuration file
-- **Detailed Logging:** Provides comprehensive logging for monitoring and debugging
-- **Metrics Endpoint:** Exposes metrics for monitoring total requests, failed requests, and active connections
-- **Demo Servers:** Includes demo servers for easy testing and development
 
-## Prerequisites
-- Go 1.23 or later
+- **Strategies:** round robin, or least active connections
+- **Health checks:** timeouts, configurable path, and thresholds so one slow check does not eject a backend
+- **Safe retries:** failover that never replays a request a backend may have acted on
+- **Streaming:** request and response bodies are streamed, including WebSocket upgrades and server-sent events
+- **Graceful shutdown:** a delay for external load balancers to stop routing here, then a bounded drain
+- **Operations:** JSON logs, `/metrics`, `/livez` and `/readyz` on a separate admin port
+- **Strict config:** every mistake is reported at startup, including misspelled options
 
 ## Installation
 
-**Install the binary:**
+**Docker:**
+```sh
+docker build --build-arg VERSION=$(git describe --tags --always) -t octoload .
+docker run -p 8080:8080 -p 8081:8081 -v "$PWD/servers.json:/etc/octoload/servers.json:ro" octoload
+```
+Inside a container, `localhost` is the container itself, so point `servers.urls` at addresses it can reach.
+
+**Binary** (Go 1.26 or later):
 ```sh
 go install github.com/itsfuad/octoload@latest
+octoload -config /path/to/servers.json
 ```
-Run `octoload` from a directory containing `servers.json`.
+`-config` defaults to `servers.json` in the working directory. `-version` prints the version.
 
-**Use as a library:**
+**As a library:**
 ```sh
 go get github.com/itsfuad/octoload@latest
 ```
 ```go
-import "github.com/itsfuad/octoload/balancer"
-
-lb := balancer.NewLoadBalancer(nil, "round_robin")
-lb.AddServer("http://localhost:8001")
-lb.StartHealthChecks(30 * time.Second)
-http.ListenAndServe(":8080", lb)
+lb, err := balancer.NewLoadBalancer(nil, balancer.StrategyRoundRobin)
+if err != nil {
+	log.Fatal(err)
+}
+if err := lb.AddServer("http://localhost:8001"); err != nil {
+	log.Fatal(err)
+}
+lb.StartHealthChecks(context.Background(), 5*time.Second)
+log.Fatal(http.ListenAndServe(":8080", lb))
 ```
-
-**From source:**
-
-1. **Clone the Repository:**
-```sh
-git clone https://github.com/itsfuad/octoload.git
-cd octoload
-```
-2. **Build the Load Balancer:**
-```sh
-go build -o octoload main.go
-```
+Always call `StartHealthChecks`: it is the only thing that restores a backend ejected after refusing a connection. In production, use an `http.Server` with timeouts and `Shutdown`, as `serve` in `main.go` does.
 
 ## Configuration
-**1. Create a JSON Configuration File:**
-Create a `servers.json` file in the root directory with the following structure:
+
 ```json
 {
     "load_balancer": {
         "port": 8080,
-        "health_check_interval_seconds": 30,
-        "strategy": "round_robin"
+        "admin_port": 8081,
+        "strategy": "round_robin",
+        "health_check_interval_seconds": 5,
+        "health_check_path": "/healthz",
+        "health_check_timeout_seconds": 2,
+        "shutdown_delay_seconds": 5,
+        "shutdown_timeout_seconds": 30,
+        "trust_forwarded_headers": false
     },
     "servers": {
         "urls": [
             "http://localhost:8001",
-            "http://localhost:8002",
-            "http://localhost:8003"
+            "http://localhost:8002"
         ]
     }
 }
 ```
 
-**Configuration Options:**
-- `port`: The port on which the load balancer will listen (default: 8080)
-- `health_check_interval_seconds`: Interval in seconds for health checks (default: 30)
-- `strategy`: Load balancing strategy - `"round_robin"` or `"least_active"` (default: "least_active")
-- `urls`: List of backend server URLs
+| Option | Default | Description |
+|---|---|---|
+| `port` | required | Traffic port. Every path is proxied. |
+| `admin_port` | `0` | Port for `/metrics`, `/livez` and `/readyz`. `0` disables it. |
+| `strategy` | `least_active` | `round_robin` or `least_active`. |
+| `health_check_interval_seconds` | required | Time between checks of each backend. |
+| `health_check_path` | `/` | Path to check. Use a cheap endpoint. Any 2xx is healthy, and redirects are followed. |
+| `health_check_timeout_seconds` | `2` | Limit for each check. |
+| `shutdown_delay_seconds` | `5` | How long to keep serving after a stop signal. Use `0` for local development. |
+| `shutdown_timeout_seconds` | `30` | Limit for draining in-flight requests. Keep this above 5: Go waits up to 5s for client connections that have not sent a request, so a lower value can report a failed drain with nothing in flight. |
+| `trust_forwarded_headers` | `false` | Keep inbound `X-Forwarded-*` values. See [Deployment](#deployment). |
 
-### Load Balancing Strategies
+`servers.urls` needs at least one `http` or `https` URL, with no duplicates. Each may include a base path. Unknown options are errors.
 
-#### Round Robin
-Distributes requests evenly across all healthy servers in a circular fashion. Each request goes to the next server in sequence, ensuring even load distribution regardless of current server load.
+## How failures are handled
 
-**When to use:**
-- All servers have similar capacity
-- You want predictable, even request distribution
-- Same client should get different servers on subsequent requests
+A backend is marked down after 2 failed health checks in a row, and restored by 1 success. A refused connection also ejects it immediately until its next check.
 
-**Example log output:**
-```
-load-balancer: Selected server http://localhost:8001 (round robin)
-load-balancer: Selected server http://localhost:8002 (round robin)
-load-balancer: Selected server http://localhost:8003 (round robin)
-```
+Failed requests follow this rule, which never repeats a request a backend may have acted on:
 
-#### Least Active
-Routes requests to the server with the fewest active connections. Automatically adapts to server performance and varying request processing times.
+| Failure | Retried on another backend? | Ejects the backend? |
+|---|---|---|
+| Connection refused | Yes, any method | Yes |
+| Other connection failure (timeout, balancer out of file descriptors or ports) | Yes, any method | No, this can be overload or a local problem |
+| Reset or timeout before response headers | Only `GET`, `HEAD` and `OPTIONS` with no body, and not upgrades | No |
+| Response already started | Never. The client connection is aborted, so the client sees a truncated response. | No |
 
-**When to use:**
-- Servers have different capacities
-- Request processing times vary significantly
-- You want automatic adaptation to server performance
+A backend's 5xx response is passed through and not retried. After up to 3 attempts, the client gets `502`. With no healthy backend it gets `503`.
 
-**Example log output:**
-```
-load-balancer: Selected server http://localhost:8001 with load 0
-load-balancer: Selected server http://localhost:8002 with load 1
-```
+Timeouts are 5s to connect and 30s for backend response headers. Once a response starts there is no limit, so downloads and streams can run as long as they need. Clients get 10s to send request headers, and idle connections close after 120s.
 
-See [LOAD_BALANCING_STRATEGIES.md](LOAD_BALANCING_STRATEGIES.md) for detailed information.
+Requests reach backends with the client's `Host`, `X-Forwarded-For`, `X-Forwarded-Host` and `X-Forwarded-Proto`. Paths and query strings are forwarded unchanged, so signed URLs keep working.
 
-**2. Running the Load Balancer:**
-Start the load balancer by executing:
-```sh
-./octoload
-```
-or
-```sh
-go run main.go
-```
-The load balancer will start on the specified port and begin routing traffic using the configured strategy.
+## Operations
 
-## Quick Start with Demo Servers
+**Admin endpoints** on `admin_port`. They have no authentication, so do not expose this port to clients.
 
-For testing and development, we provide demo servers that can be easily spawned:
+| Endpoint | Purpose |
+|---|---|
+| `GET /livez` | Always `200` while the process runs. Use for liveness: a backend outage must not restart the balancer. |
+| `GET /readyz` | `503` while draining or with no healthy backend. Use for readiness. |
+| `GET /metrics` | JSON counters and per-backend state. |
 
-**Option 1: Using PowerShell Script**
-```powershell
-.\start_demo_servers.ps1
-```
-This starts 3 demo servers on ports 8001, 8002, and 8003.
-
-**Option 2: Manual Start**
-```sh
-# Terminal 1
-go run demo/demo_server.go -id 1 -port 8001
-
-# Terminal 2
-go run demo/demo_server.go -id 2 -port 8002
-
-# Terminal 3
-go run demo/demo_server.go -id 3 -port 8003
-```
-
-**Option 3: Build and Run**
-```sh
-# Build demo server
-go build -o demo_server.exe ./demo/demo_server.go
-
-# Start servers
-./demo_server.exe -id 1 -port 8001
-./demo_server.exe -id 2 -port 8002
-./demo_server.exe -id 3 -port 8003
-```
-
-Then start the load balancer and test it:
-```sh
-# In another terminal
-go run main.go
-
-# Test with curl
-curl http://localhost:8080
-curl http://localhost:8080
-curl http://localhost:8080
-```
-
-See [DEMO_SETUP.md](DEMO_SETUP.md) for detailed demo server documentation.
-
-## Usage
-
-**Sending Requests:**
-Send HTTP requests to the load balancer's address (e.g., http://localhost:8080). The load balancer will forward the request to a backend server based on the configured strategy.
-
-**Viewing Metrics:**
-Access the metrics endpoint to monitor load balancer performance:
-```sh
-curl http://localhost:8080/metrics
-```
-
-Response:
 ```json
 {
     "TotalRequests": 150,
     "FailedRequests": 2,
-    "ActiveConnections": 3
+    "ActiveConnections": 3,
+    "Backends": [
+        {"URL": "http://localhost:8001", "Healthy": true, "Load": 1}
+    ]
 }
 ```
 
-**Server Health Checks:**
-The load balancer periodically checks each server's health by sending a `GET` request to the root endpoint. If a server does not respond with a status code of 200, it is marked as unhealthy and temporarily removed from the load balancer's pool.
+**Logs** are JSON on stdout, with one line per state change or failed attempt. There is no per-request access log.
 
-> **Note:** For production use, it's recommended to implement a dedicated `/health` endpoint that returns a lightweight response instead of using the root path.
+**Stopping:** on `SIGINT` or `SIGTERM`, `/readyz` turns `503`, requests are served for `shutdown_delay_seconds`, then the listener closes and in-flight requests get up to `shutdown_timeout_seconds` to finish. The exit code is `0` if they all finish, and `1` if the drain times out. A second signal force quits. WebSockets are not waited for, and streams still open at the timeout are cut off.
 
-**Graceful Shutdown:**
-The load balancer handles OS signals (SIGINT, SIGTERM) to perform a graceful shutdown, allowing in-progress requests to complete before terminating. Simply press `Ctrl+C` to initiate graceful shutdown.
+## Deployment
+
+Run it behind something that terminates TLS, since Octoload does not. Then set `trust_forwarded_headers: true`, or backends see `http` as the scheme and the edge's address as the client. Enable it only if clients cannot reach Octoload directly, because otherwise they can spoof these headers.
+
+**Kubernetes:** the grace period must exceed the shutdown delay plus timeout.
+```yaml
+spec:
+  terminationGracePeriodSeconds: 40
+  containers:
+    - name: octoload
+      image: octoload
+      args: ["-config", "/etc/octoload/servers.json"]
+      livenessProbe:
+        httpGet: { path: /livez, port: 8081 }
+      readinessProbe:
+        httpGet: { path: /readyz, port: 8081 }
+```
+
+**systemd:**
+```ini
+[Service]
+ExecStart=/usr/local/bin/octoload -config /etc/octoload/servers.json
+Restart=on-failure
+TimeoutStopSec=40
+DynamicUser=yes
+```
+
+## Limitations
+
+- No TLS termination. Terminate at an edge proxy.
+- No limit on concurrent connections or request rate.
+- Metrics are JSON only, with no Prometheus format. The admin port has no authentication.
+- No access log, and no tracing.
+- Configuration is read at startup. Restart to change it.
+- No weighted, sticky or IP hash strategies.
+- Unsafe requests are not retried after a connection reset, so clients must handle `502`.
+- On Windows, a refused connection probably does not eject a backend immediately, so it waits for health checks. Retries still work. Windows is compiled for releases but not tested.
+
+## Quick start with demo servers
+
+```sh
+# Three backends, each in its own terminal
+go run demo/demo_server.go -id 1 -port 8001
+go run demo/demo_server.go -id 2 -port 8002
+go run demo/demo_server.go -id 3 -port 8003
+
+# The load balancer, using the sample servers.json
+go run .
+
+# Traffic, and state
+curl http://localhost:8080
+curl http://localhost:8081/metrics
+```
+
+On Windows, `cd demo` and run `.\start.ps1` to start the backends.
 
 ## Testing
 
-**Run All Tests:**
 ```sh
-go test -v ./...
+go test -race ./...          # Everything, including the real binary with real signals
+go test -race -short ./...   # Skips the real binary and a test that waits 10s
 ```
 
-**Test with Demo Servers:**
-```sh
-go test -v -run TestLoadBalancerWithDemoServers -timeout 60s
-```
-
-This automated test will:
-1. Build and spawn 3 demo servers
-2. Test both round robin and least active strategies
-3. Verify load distribution
-4. Display detailed logs showing which server handles each request
-5. Automatically clean up all servers
-
-**Run Specific Tests:**
-```sh
-# Test only the demo server
-go test -v -run TestDemoServerDirectly
-
-# Test load balancer initialization
-go test -v -run TestLoadBalancerInitialization
-
-# Test metrics endpoint
-go test -v -run TestMetricsEndpoint
-```
-
-## Project Structure
+## Project structure
 
 ```
 octoload/
-├── main.go                          # Entry point
-├── servers.json                     # Configuration file
-├── balancer/
-│   ├── balancer.go                  # Load balancer implementation
-│   └── balancer_test.go             # Load balancer tests
-├── config/
-│   └── configs.go                   # Configuration management
-├── server/
-│   ├── server.go                    # Server handling logic
-│   └── server_test.go               # Server tests
-├── utils/
-│   ├── http.go                      # HTTP utilities
-│   ├── colors.go                    # Terminal color utilities
-│   └── http_test.go                 # Utility tests
-├── demo/
-│   └── demo_server.go               # Demo backend server
-├── demo_test.go                     # Automated demo tests
-├── start_demo_servers.ps1           # Script to start demo servers
-├── LOAD_BALANCING_STRATEGIES.md     # Strategy documentation
-├── DEMO_SETUP.md                    # Demo server guide
-└── readme.md                        # This file
+├── main.go              # Startup, shutdown and admin endpoints
+├── e2e_test.go          # Tests of the real binary
+├── servers.json         # Sample configuration
+├── Dockerfile
+├── balancer/            # Strategies, retries and health check scheduling
+├── server/              # Proxying and health checks for one backend
+├── config/              # Loading and validation
+└── demo/                # Demo backend server
 ```
-
-## Extending the Load Balancer
-
-You can extend this load balancer by:
-
-- **Adding Custom Strategies:** Implement new load balancing algorithms (e.g., weighted round robin, IP hash)
-- **Server Auto-scaling:** Add support for dynamically adding/removing servers based on load
-- **HTTPS Support:** Implement SSL/TLS termination for secure connections
-- **WebSocket Support:** Add support for WebSocket connections
-- **Connection Pooling:** Implement connection pooling for better performance
-- **Rate Limiting:** Add rate limiting per client or globally
-- **Monitoring Dashboard:** Create a web UI for real-time monitoring
-- **Session Persistence:** Implement sticky sessions for stateful applications
-- **Circuit Breaker:** Add circuit breaker pattern for failing servers
 
 ## Contributing
 
-Feel free to contribute by opening issues or submitting pull requests. Make sure to:
-- Follow the existing coding style
-- Include relevant tests for any new features or bug fixes
-- Update documentation as needed
-- Run all tests before submitting: `go test -v ./...`
-
-## Example Output
-
-### Round Robin Strategy
-```
-load-balancer: 2025/09/30 18:53:45 Added server http://localhost:8001 to the load balancer
-load-balancer: 2025/09/30 18:53:45 Added server http://localhost:8002 to the load balancer
-load-balancer: 2025/09/30 18:53:45 Added server http://localhost:8003 to the load balancer
-load-balancer: 2025/09/30 18:53:45 Load balancer is running on port 8080
-load-balancer: 2025/09/30 18:53:47 Selected server http://localhost:8001 (round robin)
-load-balancer: 2025/09/30 18:53:47 Selected server http://localhost:8002 (round robin)
-load-balancer: 2025/09/30 18:53:47 Selected server http://localhost:8003 (round robin)
-load-balancer: 2025/09/30 18:53:47 Selected server http://localhost:8001 (round robin)
-```
-
-### Least Active Strategy
-```
-load-balancer: 2025/09/30 18:53:45 Selected server http://localhost:8001 with load 0
-load-balancer: 2025/09/30 18:53:45 Selected server http://localhost:8002 with load 0
-load-balancer: 2025/09/30 18:53:45 Selected server http://localhost:8001 with load 1
-load-balancer: 2025/09/30 18:53:45 Selected server http://localhost:8003 with load 0
-```
-
-## Troubleshooting
-
-### Port Already in Use
-```
-Error: listen tcp :8080: bind: Only one usage of each socket address is normally permitted
-```
-**Solution:** Change the port in `servers.json` or stop the process using the port:
-```powershell
-# Find process using port 8080
-netstat -ano | findstr :8080
-
-# Kill the process
-taskkill /F /PID <process_id>
-```
-
-### Servers Showing as Unhealthy
-**Possible causes:**
-- Backend servers are not running
-- Firewall blocking connections
-- Wrong URLs in configuration
-
-**Solution:** 
-1. Verify servers are running: `curl http://localhost:8001`
-2. Check server logs for errors
-3. Wait for health check interval to pass
-4. Verify URLs in `servers.json` are correct
-
-### No Requests Being Routed
-**Check:**
-1. Load balancer is running and listening on correct port
-2. At least one server is healthy
-3. Requests are being sent to correct load balancer address
-
-## Performance Tips
-
-1. **Adjust Health Check Interval:** Balance between responsiveness and overhead
-   ```json
-   "health_check_interval_seconds": 30
-   ```
-
-2. **Choose Right Strategy:** 
-   - Use round robin for uniform load distribution
-   - Use least active when servers have different capacities
-
-3. **Monitor Metrics:** Regularly check the `/metrics` endpoint to identify bottlenecks
-
-4. **Server Capacity:** Ensure backend servers can handle the expected load
+See [contributing.md](contributing.md).
 
 ## License
-This project is licensed under the GNU License. See the LICENSE file for more information.
 
-## Acknowledgments
-
-- Built with Go's standard library
-- Inspired by production load balancers like NGINX and HAProxy
-- Designed for learning and production use
+This project is licensed under the GNU General Public License v3. See the LICENSE file for more information.

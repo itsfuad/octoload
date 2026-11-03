@@ -112,6 +112,8 @@ func run(configPath string, logger *slog.Logger) error {
 // serve handles requests until ctx is done, keeps serving for delay so external
 // load balancers can stop routing here, then drains in-flight requests for at
 // most timeout. Hijacked connections such as WebSockets are not waited for.
+// http.Server also waits up to 5s for connections that have not sent a request, so
+// a timeout of 5s or less can report failure with nothing actually in flight.
 func serve(ctx context.Context, listener net.Listener, handler http.Handler, delay, timeout time.Duration) error {
 	// No ReadTimeout or WriteTimeout: they would cut off long uploads and streaming responses.
 	srv := &http.Server{

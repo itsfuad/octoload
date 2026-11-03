@@ -11,15 +11,17 @@ Please make sure to follow the existing code structure and organization. This he
 Ensure that all tests pass before submitting your changes. You can run the tests using the following command:
 
 ```sh
-go test ./...
+go test -race ./...
 ```
+
+CI runs tests on both the Go version in `go.mod` and the latest stable release, because `net/http` behavior differs between them. Keep `go.mod` and the first entry of the CI matrix in line.
 
 ## Formatting
 
 Make sure to format your code before committing. You can format your Go files using the following command:
 
 ```sh
-go fmt ./...
+gofmt -w .
 ```
 
 ## Pull Requests
