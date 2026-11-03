@@ -19,7 +19,9 @@ env:
 
 jobs:
   release:
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    # The branch filter above only compares names, so a fork's pull request from its
+    # own "release" branch also matches. Only a push proves the commit is in this repo.
+    if: ${{ (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -37,11 +39,14 @@ jobs:
 
       - name: Generate Next Version
         id: semver
-        uses: mathieudutour/github-tag-action@v7
+        uses: mathieudutour/github-tag-action@af99e60ce8132224b8e6ebab5023449fe256ed46 # v7.0.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           commit_sha: ${{ env.RELEASE_SHA }}
           dry_run: true
+          # The next release must be v0.1.0 because it breaks the library API.
+          # Commit subjects are not conventional, so this sets the bump. Remove after v0.1.0 to return to patch.
+          default_bump: minor
 
       - name: Build for Multiple Platforms
         env:
@@ -82,7 +87,7 @@ jobs:
 
       - name: Create Release
         if: steps.check_release.outputs.skip == 'false' && steps.semver.outputs.new_tag != ''
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.semver.outputs.new_tag }}
           target_commitish: ${{ env.RELEASE_SHA }}
