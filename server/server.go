@@ -1,95 +1,205 @@
 package server
 
 import (
-	"bytes"
+	"context"
+	"errors"
 	"fmt"
-	"github.com/itsfuad/octoload/utils"
 	"io"
 	"log"
+	"log/slog"
+	"net"
 	"net/http"
-	"sync"
+	"net/http/httputil"
+	"net/url"
+	"strings"
+	"sync/atomic"
 	"time"
 )
 
-// client is immutable shared config; connection pooling comes from DefaultTransport.
-var client = &http.Client{Timeout: 30 * time.Second}
+// ErrUnhealthy means a request was refused before any backend I/O.
+var ErrUnhealthy = errors.New("server is not healthy")
+
+// unhealthyAfter is how many failed checks in a row mark a backend down, so one
+// slow check does not eject it. One success restores it.
+const unhealthyAfter = 2
+
+// transport is immutable shared config; connection pools are kept per backend host.
+var transport = func() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil // Backend traffic must not leave through an HTTP_PROXY from the environment.
+	t.DialContext = (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	t.ResponseHeaderTimeout = 30 * time.Second // Bounds hung backends without capping long responses.
+	t.MaxIdleConns = 0                         // The default total of 100 would cap the per-host limit.
+	t.MaxIdleConnsPerHost = 100                // The default of 2 churns connections under load.
+	t.DisableCompression = true                // Otherwise backends compress what the balancer then decompresses.
+	return t
+}()
+
+// Options configures a Server. Zero values select the defaults.
+type Options struct {
+	// TrustForwardedHeaders keeps inbound X-Forwarded-* values. Enable only behind
+	// a trusted edge: otherwise clients can spoof their IP and scheme.
+	TrustForwardedHeaders bool
+	// HealthCheckPath is requested by CheckHealth. Default "/".
+	HealthCheckPath string
+	// HealthCheckTimeout bounds each check. Default 2s.
+	HealthCheckTimeout time.Duration
+}
 
 type Server struct {
-	URL     string
-	Load    int
-	Healthy bool
-	mu      sync.RWMutex
-	logger  *log.Logger
+	URL          string
+	Load         atomic.Int64
+	Healthy      atomic.Bool
+	options      Options
+	healthURL    string
+	healthClient *http.Client
+	failedChecks atomic.Int32
+	target       *url.URL
+	logger       *slog.Logger
+	proxyLog     *log.Logger
 }
 
-func NewServer(url string, logger *log.Logger) *Server {
-	return &Server{
-		URL:     url,
-		Healthy: true,
-		logger:  logger,
+// ParseURL parses and validates a backend URL.
+func ParseURL(rawURL string) (*url.URL, error) {
+	target, err := url.Parse(rawURL)
+	if err != nil {
+		// url.Parse errors repeat the whole URL, which may hold a password.
+		return nil, fmt.Errorf("invalid server URL: %w", errors.Unwrap(err))
 	}
+	// Proxied requests never send URL credentials, and they would leak through logs and /metrics.
+	if target.User != nil {
+		return nil, fmt.Errorf("invalid server URL %q: credentials are not supported", target.Redacted())
+	}
+	// A query or fragment would swallow the health check path appended to this URL.
+	if (target.Scheme != "http" && target.Scheme != "https") || target.Host == "" || strings.ContainsAny(rawURL, "?#") {
+		return nil, fmt.Errorf("invalid server URL %q: want http(s)://host[:port][/path]", rawURL)
+	}
+	return target, nil
 }
 
-func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) error {
-	s.mu.Lock()
-	if !s.Healthy {
-		s.mu.Unlock()
-		return fmt.Errorf("server %s is not healthy", s.URL)
+// ValidateHealthCheckPath accepts "" (the default) or a path starting with "/".
+func ValidateHealthCheckPath(path string) error {
+	if path != "" && !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("invalid health check path %q: must start with /", path)
 	}
-	s.Load++
-	s.mu.Unlock()
-
-	defer func() {
-		s.mu.Lock()
-		s.Load--
-		s.mu.Unlock()
-	}()
-
-	var bodyBytes []byte
-	var err error
-	if r.Body != nil {
-		bodyBytes, err = io.ReadAll(r.Body)
-		if err != nil {
-			return fmt.Errorf("failed to read request body: %v", err)
-		}
-		// Restore body so the balancer can retry on another server.
-		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	}
-
-	req, err := http.NewRequest(r.Method, s.URL+r.RequestURI, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %v", err)
-	}
-	req.Header = r.Header.Clone()
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to execute request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	utils.CopyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-
-	if _, err = io.Copy(w, resp.Body); err != nil {
-		return fmt.Errorf("failed to copy response: %v", err)
-	}
-
 	return nil
 }
 
-func (s *Server) CheckHealth() {
-	resp, err := http.Get(s.URL + "/")
-	if err == nil {
-		resp.Body.Close()
+func NewServer(rawURL string, logger *slog.Logger, options Options) (*Server, error) {
+	target, err := ParseURL(rawURL)
+	if err != nil {
+		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := ValidateHealthCheckPath(options.HealthCheckPath); err != nil {
+		return nil, err
+	}
 
-	if err != nil || resp.StatusCode != http.StatusOK {
-		s.Healthy = false
-		s.logger.Println(utils.Colorize(fmt.Sprintf("Server %s is unhealthy\n", s.URL), utils.RED))
-	} else {
-		s.Healthy = true
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
 	}
+	if options.HealthCheckPath == "" {
+		options.HealthCheckPath = "/"
+	}
+	if options.HealthCheckTimeout == 0 {
+		options.HealthCheckTimeout = 2 * time.Second
+	}
+
+	s := &Server{
+		URL:          rawURL,
+		options:      options,
+		healthURL:    strings.TrimSuffix(rawURL, "/") + options.HealthCheckPath,
+		healthClient: &http.Client{Transport: transport, Timeout: options.HealthCheckTimeout},
+		target:       target,
+		logger:       logger,
+		proxyLog:     slog.NewLogLogger(logger.Handler(), slog.LevelError),
+	}
+	s.Healthy.Store(true)
+	return s, nil
+}
+
+// HandleRequest proxies r to this backend. An error means no response has
+// started, so the caller may write to w or retry. The exception is a failed
+// protocol upgrade, which may have hijacked the connection: never retry those. A
+// response that dies midway aborts the client connection by panicking with
+// http.ErrAbortHandler, so per-request cleanup must use defer.
+func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) error {
+	if !s.Healthy.Load() {
+		return fmt.Errorf("%w: %s", ErrUnhealthy, s.URL)
+	}
+	s.Load.Add(1)
+	defer s.Load.Add(-1)
+
+	// Without this, net/http drains the unread request body once the response
+	// starts, which truncates uploads to backends that reply while still reading.
+	// It is unsupported on HTTP/2, which is full duplex anyway.
+	_ = http.NewResponseController(w).EnableFullDuplex()
+
+	var proxyErr error
+	proxy := httputil.ReverseProxy{
+		Rewrite:      s.rewrite,
+		Transport:    transport,
+		ErrorLog:     s.proxyLog,
+		ErrorHandler: func(_ http.ResponseWriter, _ *http.Request, err error) { proxyErr = err },
+	}
+	proxy.ServeHTTP(w, r)
+	return proxyErr
+}
+
+func (s *Server) rewrite(pr *httputil.ProxyRequest) {
+	pr.SetURL(s.target)
+	pr.Out.Host = pr.In.Host // Vhost routing and backend-built redirects need the client's Host.
+	// ReverseProxy may re-encode the query, which breaks signed URLs. Nothing here
+	// routes on the query, so forwarding it raw cannot cause a parsing mismatch.
+	pr.Out.URL.RawQuery = pr.In.URL.RawQuery
+
+	if !s.options.TrustForwardedHeaders {
+		pr.SetXForwarded()
+		return
+	}
+	pr.Out.Header["X-Forwarded-For"] = pr.In.Header["X-Forwarded-For"] // SetXForwarded appends the peer to this.
+	pr.SetXForwarded()
+	for _, name := range []string{"X-Forwarded-Host", "X-Forwarded-Proto"} {
+		if value := pr.In.Header.Get(name); value != "" {
+			pr.Out.Header.Set(name, value)
+		}
+	}
+}
+
+// CheckHealth probes the backend once and updates Healthy. A cancelled ctx says
+// nothing about the backend, so it changes nothing.
+func (s *Server) CheckHealth(ctx context.Context) {
+	err := s.probe(ctx)
+	if ctx.Err() != nil {
+		return
+	}
+
+	if err == nil {
+		s.failedChecks.Store(0)
+		if !s.Healthy.Swap(true) {
+			s.logger.Info("server recovered", "url", s.URL)
+		}
+		return
+	}
+	if s.failedChecks.Add(1) >= unhealthyAfter && s.Healthy.Swap(false) {
+		s.logger.Warn("server unhealthy", "url", s.URL, "error", err)
+	}
+}
+
+func (s *Server) probe(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.healthURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := s.healthClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	// Drain a little so small responses can reuse the connection.
+	io.CopyN(io.Discard, resp.Body, 64<<10)
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("health check returned status %d", resp.StatusCode)
+	}
+	return nil
 }

@@ -12,51 +12,65 @@ on:
 
 permissions:
   contents: write
-  issues: write
-  pull-requests: write
+
+env:
+  # workflow_run runs on the default branch. Release the commit CI actually tested.
+  RELEASE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
   release:
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    # The branch filter above only compares names, so a fork's pull request from its
+    # own "release" branch also matches. Only a push proves the commit is in this repo.
+    if: ${{ (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
+          ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.21'
+          # Release binaries embed the standard library, so always ship the latest fixes.
+          go-version: stable
+
+      - name: Generate Next Version
+        id: semver
+        uses: mathieudutour/github-tag-action@af99e60ce8132224b8e6ebab5023449fe256ed46 # v7.0.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          commit_sha: ${{ env.RELEASE_SHA }}
+          dry_run: true
+          # The next release must be v0.1.0 because it breaks the library API.
+          # Commit subjects are not conventional, so this sets the bump. Remove after v0.1.0 to return to patch.
+          default_bump: minor
 
       - name: Build for Multiple Platforms
+        env:
+          VERSION: ${{ steps.semver.outputs.new_tag }}
         run: |
           mkdir -p releases
-          
+
           # Build for different platforms
           PLATFORMS=("windows/amd64" "linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64")
           for platform in "${PLATFORMS[@]}"; do
             OS=${platform%/*}
             ARCH=${platform#*/}
             output_name="releases/octoload-${OS}-${ARCH}"
-            if [ $OS = "windows" ]; then
+            if [ "$OS" = "windows" ]; then
               output_name="$output_name.exe"
             fi
             echo "Building for $OS/$ARCH..."
-            GOOS=$OS GOARCH=$ARCH go build -ldflags="-s -w" -o "$output_name" .
+            CGO_ENABLED=0 GOOS=$OS GOARCH=$ARCH go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "$output_name" .
           done
-          
+
           # Make binaries executable
           chmod +x releases/*
 
-      - name: Generate Next Version
-        id: semver
-        uses: mathieudutour/github-tag-action@v6.1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          dry_run: true
+          cd releases && sha256sum * > checksums.txt
 
       - name: Check if release already exists
         id: check_release
@@ -71,23 +85,21 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Debug file listing
-        run: ls -R releases
-
       - name: Create Release
         if: steps.check_release.outputs.skip == 'false' && steps.semver.outputs.new_tag != ''
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.semver.outputs.new_tag }}
+          target_commitish: ${{ env.RELEASE_SHA }}
           name: "Octoload ${{ steps.semver.outputs.new_tag }}"
           body: |
             ## What's Changed
-            
+
             ${{ steps.semver.outputs.changelog }}
-            
+
             ## Downloads
-            
-            Download the appropriate binary for your platform:
+
+            Download the appropriate binary for your platform, and verify it against `checksums.txt`:
             - **Linux (x64)**: octoload-linux-amd64
             - **Linux (ARM64)**: octoload-linux-arm64
             - **Windows (x64)**: octoload-windows-amd64.exe
